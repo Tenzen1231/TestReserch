@@ -1,0 +1,114 @@
+name: Council CI integration gate
+run-name: '${{ inputs.base_branch }} <- ${{ inputs.source_branch }} (${{ inputs.mode }})'
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: 'Target test branch (feature/* only)'
+        required: true
+        type: string
+      source_branch:
+        description: 'Submission branch (feature/* only)'
+        required: true
+        type: string
+      mode:
+        description: 'enforce validates the merged candidate; pr_only is an intentionally unsafe control'
+        required: true
+        type: choice
+        options:
+          - enforce
+          - pr_only
+        default: enforce
+      hold_seconds:
+        description: 'Pause before publication for controlled concurrency tests (0..90)'
+        required: true
+        type: number
+        default: 0
+
+permissions:
+  contents: write
+
+concurrency:
+  group: council-ci-gate-${{ inputs.base_branch }}
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  integrate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      SOURCE_BRANCH: ${{ inputs.source_branch }}
+      GATE_MODE: ${{ inputs.mode }}
+      HOLD_SECONDS: ${{ inputs.hold_seconds }}
+      STATE_DIR: ${{ runner.temp }}/council-ci-gate
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out trusted gate and oracle
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare and validate candidate
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python queue_gate.py prepare
+          --repo "$GITHUB_WORKSPACE" --state-dir "$STATE_DIR"
+          --base-branch "$BASE_BRANCH" --source-branch "$SOURCE_BRANCH"
+          --mode "$GATE_MODE" --hold-seconds "$HOLD_SECONDS"
+
+      - name: Hold for concurrent changes
+        if: steps.prepare.outputs.ready == 'true'
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, time
+          state = json.loads((pathlib.Path(os.environ['STATE_DIR']) / 'state.json').read_text())
+          seconds = state['hold_seconds']
+          print(f'Holding {seconds} seconds before re-observing source and target.', flush=True)
+          time.sleep(seconds)
+          PY
+
+      - name: Revalidate and publish exact candidate
+        if: steps.prepare.outputs.ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python queue_gate.py publish --repo "$GITHUB_WORKSPACE" --state-dir "$STATE_DIR"
+
+      - name: Summarize decision
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path(os.environ['STATE_DIR']) / 'result.json'
+          if not path.exists():
+              raise SystemExit('Gate did not produce result.json; inspect preceding setup errors.')
+          result = json.loads(path.read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
+              stream.write('## ' + result['decision'].upper() + '\n\n')
+              if result.get('negative_control'):
+                  stream.write('**INTENTIONALLY UNSAFE NEGATIVE CONTROL: merged result was not validated.**\n\n')
+              for key in ('reason', 'source_branch', 'base_branch', 'source', 'base', 'candidate', 'tree',
+                          'published_candidate', 'observed_remote_head', 'validator_sha256'):
+                  if key in result:
+                      stream.write(f'- {key}: `{result[key]}`\n')
+              stream.write(f"- Candidate attempts: {len(result['attempts'])}\n")
+              stream.write('\nExpected rejection is a gate decision; the workflow stays green so evidence is uploaded.\n')
+          PY
+
+      - name: Upload queue evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queue-evidence
+          path: |
+            ${{ runner.temp }}/council-ci-gate/result.json
+            ${{ runner.temp }}/council-ci-gate/gate.log
+          if-no-files-found: error
+          retention-days: 30
