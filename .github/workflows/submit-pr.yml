@@ -1,0 +1,45 @@
+name: Автоматическая заявка PR
+run-name: 'PR #${{ github.event.number }} — ${{ github.event.action }} — ${{ github.event.pull_request.head.sha }}'
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+    branches: [feature/team-shared]
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: write
+
+jobs:
+  submit:
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read trusted dispatcher from main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            queue_pr.py
+            queue_status.py
+            acceptance.py
+          sparse-checkout-cone-mode: false
+
+      - name: Submit the exact open PR version
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUSTED_DISPATCHER_SHA: ${{ github.sha }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python queue_pr.py
+
+      - name: Save event trace
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr-dispatch
+          path: ${{ runner.temp }}/pr-dispatch.json
+          if-no-files-found: error
+          retention-days: 30

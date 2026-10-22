@@ -22,6 +22,9 @@ import uuid
 
 from queue_status import CommitStatuses, StatusError
 from queue_repair import RouterRepairClient, RepairError, MODEL, strict_json
+from queue_pr import guard as guard_pr, PRError, EVENTS, TARGET
+from queue_structural import StructuralRepairClient, StructuralError
+from queue_budget import reserve as reserve_budget, BudgetError
 from acceptance import CONTRACTS, REGISTRY_PATH, contract_cases
 
 
@@ -30,7 +33,8 @@ MAX_ATTEMPTS = 3
 MAX_REPAIRS = 2
 VALIDATION_IMAGE = "python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2"
 INFRASTRUCTURE_ERRORS = {"internal_error", "git_error", "status_delivery_failed", "trusted_control_changed",
-                         "publication_unconfirmed", "validation_infrastructure_error", "candidate_not_observed"}
+                         "publication_unconfirmed", "validation_infrastructure_error", "candidate_not_observed",
+                         "structural_infrastructure_error", "budget_unavailable"}
 REASONS_RU = {
     "validation_failed": "проверки общего результата не пройдены",
     "merge_conflict": "изменения конфликтуют с общей веткой",
@@ -50,6 +54,13 @@ REASONS_RU = {
     "repair_rerun_blocked": "повтор запуска не возобновляет ремонт; нужен человек",
     "invalid_requirements": "не удалось прочитать сохранённые требования",
     "requirement_not_recorded": "для принятой версии не зарегистрировано это требование",
+    "pr_superseded": "есть более новый push; он проверяется отдельной заявкой",
+    "pr_changed": "параметры PR изменились; нужна проверка нового события",
+    "pr_not_ready": "PR закрыт или ещё является черновиком",
+    "invalid_pr": "заявка не соответствует открытому PR команды",
+    "invalid_pr_requirement": "в описании PR нужно указать одно известное требование",
+    "structural_infrastructure_error": "не удалось запустить проверенный Mergiraf",
+    "budget_unavailable": "не удалось подтвердить сохранённый лимит ремонта",
 }
 
 
@@ -182,6 +193,8 @@ class Gate:
         return result.returncode == 0
 
     def observe(self, stage):
+        if stage != "after_publication":
+            self.check_pr(stage)
         # Fresh local refs avoid forced refspecs, even for observations after a
         # rejected push. The checked-out trusted main branch never moves.
         prefix = "refs/council-observations/" + uuid.uuid4().hex
@@ -192,9 +205,25 @@ class Gate:
                  source_ref + ":" + prefix + "/source")
         observation = {"stage": stage, "at": now(), "base": self.text("rev-parse", prefix + "/base"),
                        "source": self.text("rev-parse", prefix + "/source")}
+        if stage != "after_publication" and self.state.get("pr_request"):
+            if observation["source"] != self.state["pr_request"]["expected_head"]:
+                raise Rejected("pr_superseded", "Fetched source differs from the PR event version")
         self.result["observations"].append(observation)
         self.save()
         return observation
+
+    def check_pr(self, stage):
+        request = self.state.get("pr_request")
+        if request is None:
+            return
+        if self.statuses is None:
+            self.statuses = CommitStatuses.from_environment()
+        try:
+            observed = guard_pr(self.statuses, request)
+        except PRError as error:
+            raise Rejected(error.reason, str(error)) from None
+        self.result.setdefault("pr_observations", []).append({"stage": stage, "at": now(), **observed})
+        self.save()
 
     def reject(self, reason, detail=None):
         infrastructure = reason in INFRASTRUCTURE_ERRORS
@@ -247,6 +276,9 @@ class Gate:
                 or digest(Path(__file__).with_name("queue_repair.py")) != self.state["repair_module_sha256"]
                 or digest(Path(__file__).with_name("queue_status.py")) != self.state["status_module_sha256"]):
             raise Rejected("trusted_control_changed", "Trusted gate/oracle checkout changed during the run")
+        for name, expected in self.state.get("extra_control_hashes", {}).items():
+            if digest(self.repo / name) != expected:
+                raise Rejected("trusted_control_changed", "Trusted queue module changed during the run")
 
     def validation_command(self, tested_commit):
         github = os.environ.get("GITHUB_ACTIONS") == "true"
@@ -386,7 +418,47 @@ class Gate:
                                   for name in sorted(ALLOWED) if (directory / name).is_file()},
             "previous_repairs": [{"reason": item.get("reason"), "explanation": item.get("explanation")}
                                  for item in self.result.get("repairs", [])],
+            "conflict_paths": sorted(self.text("diff", "--name-only", "--diff-filter=U", cwd=directory).splitlines()),
         }
+
+    def apply_proposal(self, directory, proposal):
+        self.trusted_unchanged()
+        for name, content in proposal["files"].items():
+            if name not in ALLOWED or (directory / name).is_symlink():
+                raise Rejected("scope_violation", "Repair attempted to change a protected path")
+            (directory / name).write_text(content, encoding="utf-8")
+        self.git("add", "--", *sorted(proposal["files"]), cwd=directory)
+
+    def structural_candidate(self, directory, common, source, base, attempt):
+        record = {"started_at": now(), "source": source, "base": base, "state": "started"}
+        self.result.setdefault("structural_repairs", []).append(record)
+        self.save()
+        self.status(source, "pending", "Соединяем структуру кода через Mergiraf")
+        try:
+            client = StructuralRepairClient.from_environment(allowed_paths=ALLOWED)
+            proposal = client.propose(self.repair_context(directory, common, source, base,
+                                                         {"reason": "merge_conflict"}))
+            record.update(metadata=proposal["metadata"], explanation=proposal["explanation"],
+                          changed_paths=sorted(proposal["files"]),
+                          patch_sha256=hashlib.sha256(json.dumps(proposal["files"], sort_keys=True).encode()).hexdigest())
+            self.apply_proposal(directory, proposal)
+            candidate, tree = self.candidate_commit(directory, source, base, attempt)
+            record.update(state="validated", candidate=candidate, tree=tree,
+                          validation=self.result["validation"], finished_at=now())
+            self.save()
+            return candidate, tree
+        except StructuralError as error:
+            record.update(state="unresolved", reason=error.reason, detail=self.clean(error.detail),
+                          metadata=error.metadata, finished_at=now())
+            self.save()
+            if error.reason not in {"structural_unresolved", "structural_invalid_input", "structural_timeout",
+                                    "structural_invalid_output", "structural_input_too_large", "structural_output_too_large"}:
+                raise Rejected("structural_infrastructure_error", error.reason) from None
+            raise Rejected("merge_conflict", "Mergiraf did not produce a complete resolution") from None
+        except Rejected as error:
+            record.update(state="rejected", reason=error.reason, finished_at=now())
+            self.save()
+            raise
 
     def repair_candidate(self, directory, common, source, base, attempt, error):
         if not self.state["auto_repair"]:
@@ -395,27 +467,41 @@ class Gate:
             raise Rejected("repair_rerun_blocked", "A job rerun cannot reset the automatic repair budget")
         refusal = {"reason": error.reason, "validation": self.result.get("validation")}
         while self.state["repair_calls_reserved"] < MAX_REPAIRS:
+            self.check_pr("before_repair_reservation")
+            reservation = None
+            if self.state["durable_budget"]:
+                try:
+                    reservation = reserve_budget(self.git, os.environ.get("GITHUB_REPOSITORY", ""),
+                                                 self.state["base_branch"], source,
+                                                 os.environ.get("GITHUB_RUN_ID", ""),
+                                                 int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
+                                                 remote=self.publisher_remote())
+                except BudgetError as failure:
+                    self.result["budget_refusal"] = {"reason": failure.reason, "detail": failure.detail,
+                                                     "metadata": failure.metadata}
+                    self.save()
+                    reason = "repair_exhausted" if failure.reason == "budget_exhausted" else "budget_unavailable"
+                    raise Rejected(reason, failure.detail) from None
             # Reserve durably BEFORE constructing the HTTP client or making a
             # request. Unknown outcomes and invalid responses consume budget.
             self.state["repair_calls_reserved"] += 1
             record = {"number": self.state["repair_calls_reserved"], "started_at": now(),
                       "source": source, "base": base, "refusal": refusal, "state": "reserved"}
+            if reservation:
+                record["budget_reservation"] = reservation
             self.result.setdefault("repairs", []).append(record)
             self.save()
-            self.status(source, "pending", "Исправляем автоматически: попытка " + str(record["number"]) + "/2")
+            ordinal = reservation["ordinal"] if reservation else record["number"]
+            self.status(source, "pending", "Исправляем автоматически: попытка " + str(ordinal) + "/2")
             try:
+                self.check_pr("before_router_post")
                 client = RouterRepairClient.from_environment(allowed_paths=ALLOWED)
                 proposal = client.propose(self.repair_context(directory, common, source, base, refusal))
                 record.update(metadata=proposal["metadata"], explanation=proposal["explanation"],
                               patch_sha256=hashlib.sha256(json.dumps(proposal["files"], sort_keys=True).encode()).hexdigest(),
                               changed_paths=sorted(proposal["files"]), state="proposed")
                 self.save()
-                self.trusted_unchanged()
-                for name, content in proposal["files"].items():
-                    if name not in ALLOWED or (directory / name).is_symlink():
-                        raise Rejected("scope_violation", "Repair attempted to change a protected path")
-                    (directory / name).write_text(content, encoding="utf-8")
-                self.git("add", "--", *sorted(proposal["files"]), cwd=directory)
+                self.apply_proposal(directory, proposal)
                 candidate, tree = self.candidate_commit(directory, source, base, attempt)
                 record.update(state="validated", candidate=candidate, tree=tree,
                               validation=self.result["validation"], finished_at=now())
@@ -483,7 +569,15 @@ class Gate:
                 raise
             attempt["initial_rejection"] = error.reason
             self.save()
-            candidate, tree = self.repair_candidate(directory, common, source, base, attempt, error)
+            if error.reason == "merge_conflict" and self.state["structural_repair"]:
+                try:
+                    candidate, tree = self.structural_candidate(directory, common, source, base, attempt)
+                except Rejected as structural_error:
+                    if structural_error.reason not in ("merge_conflict", "validation_failed"):
+                        raise
+                    candidate, tree = self.repair_candidate(directory, common, source, base, attempt, structural_error)
+            else:
+                candidate, tree = self.repair_candidate(directory, common, source, base, attempt, error)
         self.state["prepared"] = {"source": source, "base": base, "candidate": candidate,
                                   "tree": tree, "attempt": number, "directory": str(directory)}
         self.result.update(decision="prepared", reason="checks_passed", decision_label="Ожидает публикации")
@@ -501,18 +595,35 @@ class Gate:
             raise Rejected("invalid_input", "Unknown trusted requirement")
         self.state.update(base_branch=args.base_branch, source_branch=args.source_branch,
                           requirement=args.requirement, auto_repair=os.environ.get("QUEUE_AUTO_REPAIR") == "true",
+                          structural_repair=os.environ.get("QUEUE_STRUCTURAL_REPAIR") == "true",
+                          durable_budget=os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("QUEUE_DURABLE_BUDGET") == "true",
                           repair_calls_reserved=0,
                           hold_seconds=seconds, repo=str(self.repo), trusted_head=self.text("rev-parse", "HEAD"),
                           validator_sha256=digest(self.oracle), gate_sha256=digest(__file__),
                           repair_module_sha256=digest(Path(__file__).with_name("queue_repair.py")),
                           status_module_sha256=digest(Path(__file__).with_name("queue_status.py")))
+        self.state["extra_control_hashes"] = {name: digest(self.repo / name) for name in
+                                              ("queue_pr.py", "queue_structural.py", "queue_budget.py")}
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            number, expected, dispatcher = (os.environ.get(key, "") for key in
+                                            ("PR_NUMBER", "EXPECTED_HEAD", "DISPATCHER_RUN_ID"))
+            action = os.environ.get("PR_EVENT_ACTION", "")
+            if (args.base_branch != TARGET or not number.isdigit() or not dispatcher.isdigit()
+                    or not re.fullmatch(r"[0-9a-f]{40}", expected) or action not in EVENTS):
+                raise Rejected("invalid_pr", "A PR event number, exact head and dispatcher trace are required")
+            self.state["pr_request"] = {"pr_number": int(number), "expected_head": expected,
+                                        "source_branch": args.source_branch, "requirement": args.requirement}
+            self.result.update(pr_number=int(number), expected_head=expected,
+                               dispatcher_run_id=dispatcher, event_action=action)
         self.result.update(base_branch=args.base_branch, source_branch=args.source_branch,
                            validator_sha256=self.state["validator_sha256"],
                            gate_sha256=self.state["gate_sha256"], trusted_head=self.state["trusted_head"],
                            max_attempts=MAX_ATTEMPTS)
         self.result.update(max_repair_calls=MAX_REPAIRS, repair_model=MODEL, repairs=[],
+                           structural_repairs=[], structural_repair=self.state["structural_repair"],
                            requirement=args.requirement, auto_repair=self.state["auto_repair"],
-                           repair_budget_scope="one workflow run; job reruns cannot call the repair API")
+                           repair_budget_scope="repository + target branch + immutable source SHA" if self.state["durable_budget"]
+                           else "local test run; job reruns cannot call the repair API")
         self.save()
         self.build(self.observe("prepare"), "initial_prepare")
 
@@ -537,6 +648,14 @@ class Gate:
         self.log("Принято: " + candidate)
         self.save()
 
+    def publisher_remote(self):
+        if os.environ.get("QUEUE_SSH_PUBLISH") != "true":
+            return "origin"
+        repository = os.environ.get("GITHUB_REPOSITORY", "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+            raise Rejected("invalid_input", "SSH publication requires the GitHub repository identity")
+        return "git@github.com:" + repository + ".git"
+
     def publish(self):
         self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.result = json.loads(self.result_path.read_text(encoding="utf-8"))
@@ -560,12 +679,7 @@ class Gate:
                 raise Rejected("non_forward_candidate", "Publication must preserve the target history")
             if self.result["validation"]["tested_commit"] != prepared["candidate"]:
                 raise Rejected("untested_candidate", "Published SHA must equal the tested SHA")
-            remote = "origin"
-            if os.environ.get("QUEUE_SSH_PUBLISH") == "true":
-                repository = os.environ.get("GITHUB_REPOSITORY", "")
-                if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-                    raise Rejected("invalid_input", "SSH publication requires the GitHub repository identity")
-                remote = "git@github.com:" + repository + ".git"
+            remote = self.publisher_remote()
             self.result.update(publication_attempted=True, attempted_candidate=prepared["candidate"])
             self.save()
             try:

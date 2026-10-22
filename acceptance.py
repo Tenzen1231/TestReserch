@@ -7,6 +7,9 @@ import sys
 
 
 CONTRACTS = {
+    "prefix": "receipt.format_total(amount, prefix='') prepends the exact prefix string to the original two-decimal amount. Preserve suffix if accepted, default formatting and every existing feature.",
+    "suffix": "receipt.format_total(amount, suffix='') appends the exact suffix string to the original two-decimal amount. Preserve prefix if accepted; combined format_total(12.34,prefix='Итого ',suffix=' руб.') == 'Итого 12.34 руб.'. Preserve default formatting and every existing feature.",
+    "round-up": "receipt.round_up_total(amount) returns ceil(float(amount)) as int: 12.34 -> 13, 12 -> 12, 0.01 -> 1, -12.34 -> -12. Preserve every existing receipt and pricing feature.",
     "discount": "price_units(amount, discount_percent=0): return integer kopeks after percent discount. Formula round(float(amount)*100*(100-discount_percent)/100). Preserve the default price and all existing APIs.",
     "fee": "price_units(amount, fee_kopeks=0): add an integer fee in kopeks AFTER rounding the discounted price. With discount accepted the joint formula is round(float(amount)*100*(100-discount_percent)/100)+fee_kopeks. Preserve all existing APIs.",
     "currency": "receipt.format_currency_total(amount) returns receipt.format_total(amount) + ' RUB'. Preserve the original format_total API and every accepted money feature.",
@@ -42,6 +45,17 @@ def contract_cases(requirements=()):
             cases.append((f"currency:{amount}", "receipt", "format_currency_total", [amount], {}, f"{amount:.2f} RUB"))
     if "legacy-rubles" in requirements:
         cases.append(("legacy:rubles", "money", "price_units", [100], {}, 100))
+    for amount, rendered in ((0, "0.00"), (0.01, "0.01"), (12.34, "12.34"), (100, "100.00")):
+        if "prefix" in requirements:
+            cases.append((f"prefix:{amount}", "receipt", "format_total", [amount], {"prefix": "Итого "}, "Итого " + rendered))
+        if "suffix" in requirements:
+            cases.append((f"suffix:{amount}", "receipt", "format_total", [amount], {"suffix": " руб."}, rendered + " руб."))
+        if {"prefix", "suffix"} <= requirements:
+            cases.append((f"prefix-suffix:{amount}", "receipt", "format_total", [amount],
+                          {"prefix": "Итого ", "suffix": " руб."}, "Итого " + rendered + " руб."))
+    if "round-up" in requirements:
+        for amount, expected in ((12.34, 13), (12, 12), (0.01, 1), (-12.34, -12), (0, 0)):
+            cases.append((f"round-up:{amount}", "receipt", "round_up_total", [amount], {}, expected))
     return cases
 
 
