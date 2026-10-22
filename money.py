@@ -1,2 +1,2 @@
 def price_units(amount):
-    return float(amount) + 0.0
+    return round(float(amount) * 100)
