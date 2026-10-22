@@ -1,25 +1,49 @@
 """Small CI integration gate. Only ordinary forward pushes publish candidates.
 
-The pr_only mode is an intentionally unsafe negative control, never an
-alternative production policy. Remote source/target observations are snapshots,
-not an atomic transaction across both GitHub references.
+Remote source/target observations are snapshots, not an atomic transaction
+across both GitHub references. Informational source statuses are not publisher
+authorization; only the exact merged and validated candidate may be pushed.
 """
 
 import argparse
 import base64
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
+import tarfile
 import traceback
 import uuid
+
+from queue_status import CommitStatuses, StatusError
 
 
 ALLOWED = {"money.py", "receipt.py", "email_receipt.py", "feature_a.py", "feature_b.py", "feature_c.py"}
 MAX_ATTEMPTS = 3
+VALIDATION_IMAGE = "python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2"
+INFRASTRUCTURE_ERRORS = {"internal_error", "git_error", "status_delivery_failed", "trusted_control_changed",
+                         "publication_unconfirmed", "validation_infrastructure_error", "candidate_not_observed"}
+REASONS_RU = {
+    "validation_failed": "проверки общего результата не пройдены",
+    "merge_conflict": "изменения конфликтуют с общей веткой",
+    "scope_violation": "изменены защищённые или необъявленные файлы",
+    "unsupported_file_type": "ссылки и подмодули не поддерживаются",
+    "retry_limit": "ветки менялись во время повторных проверок",
+    "push_rejected": "сервер не принял публикацию после повторных проверок",
+    "invalid_input": "неверные параметры запуска",
+    "status_delivery_failed": "не удалось подтвердить статус в GitHub",
+    "publication_unconfirmed": "исход публикации не подтверждён; проверьте запуск",
+    "candidate_not_observed": "проверенный commit не найден в общей ветке",
+    "validation_infrastructure_error": "среда проверки недоступна",
+    "git_error": "не удалось выполнить операцию Git",
+    "trusted_control_changed": "код проверки изменился во время запуска",
+    "interrupted": "запуск прерван до подтверждения результата",
+}
 
 
 def now():
@@ -28,6 +52,31 @@ def now():
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def complete_validation_report(stdout, returncode):
+    """Fail closed if imported code exits before the fixed oracle finishes."""
+    expected = {module + ":" + str(amount): f"{amount:.2f}"
+                for module in ("receipt", "email_receipt") for amount in (0, 0.01, 12.34, 100)}
+    try:
+        report = json.loads(stdout)
+        checks = report["checks"]
+        identifiers = [check["check"] for check in checks]
+        if (returncode != 0 or report.get("passed") is not True or len(checks) != 9
+                or set(identifiers) != set(expected) | {"three_way_interaction"}
+                or any(check.get("passed") is not True for check in checks)):
+            return False, report
+        for check in checks:
+            if check["check"] in expected:
+                if check.get("expected") != expected[check["check"]] or check.get("actual") != expected[check["check"]]:
+                    return False, report
+            else:
+                flags = check.get("flags")
+                if not isinstance(flags, list) or len(flags) != 3 or any(type(flag) is not bool for flag in flags) or all(flags):
+                    return False, report
+        return True, report
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False, None
 
 
 class Rejected(RuntimeError):
@@ -47,11 +96,35 @@ class Gate:
         self.oracle = self.repo / "acceptance.py"
         self.token = os.environ.get("GITHUB_TOKEN", "")
         self.auth = base64.b64encode(("x-access-token:" + self.token).encode()).decode() if self.token else ""
+        self.statuses = None
         self.state = {}
         self.result = {"version": 1, "decision": "rejected", "reason": "not_prepared", "attempts": [],
                        "observations": [], "created_at": now(), "run_id": os.environ.get("GITHUB_RUN_ID"),
                        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-                       "repository": os.environ.get("GITHUB_REPOSITORY")}
+                       "repository": os.environ.get("GITHUB_REPOSITORY"), "status_events": [], "status_errors": []}
+
+    def status(self, sha, value, description):
+        if self.statuses is None:
+            self.statuses = CommitStatuses.from_environment()
+        if self.statuses is None:
+            self.result["status_delivery"] = "disabled_local"
+            self.save()
+            return
+        event = self.statuses.send(sha, self.state["base_branch"], value, description)
+        event.update(base=self.result.get("base"), candidate=self.result.get("candidate"),
+                     target_branch=self.state["base_branch"], at=now())
+        if not any(item.get("id") == event.get("id") for item in self.result.setdefault("status_events", [])):
+            self.result["status_events"].append(event)
+        self.result["status_context"] = event["context"]
+        self.result["status_delivery"] = "confirmed"
+        self.save()
+
+    def select_source(self, source):
+        previous = self.state.get("active_source")
+        if previous and previous != source:
+            self.status(previous, "failure", "Отклонено: версия изменена; проверяется " + source[:8])
+        self.state["active_source"] = source
+        self.save()
 
     def clean(self, value):
         value = str(value)
@@ -116,15 +189,25 @@ class Gate:
         return observation
 
     def reject(self, reason, detail=None):
-        self.result.update(decision="rejected", reason=reason)
+        infrastructure = reason in INFRASTRUCTURE_ERRORS
+        label = "Ошибка" if infrastructure else "Отклонено"
+        description = label + ": " + REASONS_RU.get(reason, reason)
+        self.result.update(decision="error" if infrastructure else "rejected", reason=reason,
+                           decision_label=label, description=description)
         if detail:
             self.result["detail"] = self.clean(detail)
-        self.log("REJECTED: " + reason)
+        self.log(description)
         self.save()
 
-    def validate_inputs(self, base, source, mode, hold):
-        if mode not in ("enforce", "pr_only"):
-            raise Rejected("invalid_input", "mode must be enforce or pr_only")
+        if self.state.get("active_source"):
+            try:
+                self.status(self.state["active_source"], "error" if infrastructure else "failure", description)
+            except StatusError as error:
+                self.result.setdefault("status_errors", []).append(str(error))
+                self.result["status_delivery"] = "failed"
+                self.save()
+
+    def validate_inputs(self, base, source, hold):
         for branch in (base, source):
             if not branch.startswith("feature/") or self.git(
                     "check-ref-format", "refs/heads/" + branch, check=False).returncode:
@@ -150,8 +233,43 @@ class Gate:
     def trusted_unchanged(self):
         if (self.text("rev-parse", "HEAD") != self.state["trusted_head"]
                 or digest(self.oracle) != self.state["validator_sha256"]
-                or digest(__file__) != self.state["gate_sha256"]):
+                or digest(__file__) != self.state["gate_sha256"]
+                or digest(Path(__file__).with_name("queue_status.py")) != self.state["status_module_sha256"]):
             raise Rejected("trusted_control_changed", "Trusted gate/oracle checkout changed during the run")
+
+    def validation_command(self, tested_commit):
+        github = os.environ.get("GITHUB_ACTIONS") == "true"
+        if not github and os.environ.get("QUEUE_VALIDATION_DOCKER") != "true":
+            return None, None
+        image = VALIDATION_IMAGE if github else os.environ.get("VALIDATION_IMAGE", VALIDATION_IMAGE)
+        if not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}", image):
+            raise Rejected("validation_infrastructure_error", "Validator image must be pinned by digest")
+        export = self.directory / ("validation-tree-" + uuid.uuid4().hex)
+        export.mkdir()
+        archive = subprocess.run(["git", "archive", "--format=tar", tested_commit], cwd=self.repo,
+                                 capture_output=True, check=True, timeout=60).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as stream:
+            for member in stream.getmembers():
+                parts = PurePosixPath(member.name).parts
+                if member.name.startswith("/") or any(p in ("..", ".git") for p in parts):
+                    raise Rejected("validation_infrastructure_error", "Unsafe archive path")
+                path = export.joinpath(*parts)
+                if member.isdir():
+                    path.mkdir(parents=True, exist_ok=True)
+                elif member.isfile():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(stream.extractfile(member).read())
+                    path.chmod(0o444)
+                else:
+                    raise Rejected("unsupported_file_type", "Only regular files may enter validation")
+        container = "council-validation-" + uuid.uuid4().hex
+        command = ["docker", "run", "--rm", "--pull=never", "--name", container, "--network=none", "--read-only",
+                   "--user=65534:65534", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=64",
+                   "--memory=256m", "--cpus=1", "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=16m",
+                   "--mount", "type=bind,src=" + str(export) + ",dst=/candidate,readonly",
+                   "--mount", "type=bind,src=" + str(self.oracle) + ",dst=/oracle/acceptance.py,readonly",
+                   "--workdir=/candidate", image, "python", "-I", "-B", "/oracle/acceptance.py", "/candidate"]
+        return command, {"container": container, "image": image, "network": "none", "exported_commit": tested_commit}
 
     def run_validation(self, directory, tested_commit, scope):
         before_hash = digest(self.oracle)
@@ -159,16 +277,23 @@ class Gate:
         env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
         env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1")
         self.log("Validating " + scope + " commit " + tested_commit)
+        command, sandbox = self.validation_command(tested_commit)
         try:
-            process = subprocess.run([sys.executable, "-I", "-B", str(self.oracle), str(directory)],
+            process = subprocess.run(command or [sys.executable, "-I", "-B", str(self.oracle), str(directory)],
                                      cwd=self.repo, env=env, capture_output=True, text=True,
                                      encoding="utf-8", errors="replace", timeout=120)
-            validation = {"passed": process.returncode == 0, "returncode": process.returncode,
+            if sandbox and process.returncode in (125, 126, 127):
+                raise Rejected("validation_infrastructure_error", self.clean(process.stderr[-2000:]))
+            passed, report = complete_validation_report(process.stdout, process.returncode)
+            validation = {"passed": passed, "returncode": process.returncode, "report": report,
                           "stdout": self.clean(process.stdout[-16000:]), "stderr": self.clean(process.stderr[-16000:]),
                           "tested_commit": tested_commit, "scope": scope, "validator_sha256": before_hash}
         except subprocess.TimeoutExpired:
+            if sandbox:
+                subprocess.run(["docker", "kill", sandbox["container"]], capture_output=True, timeout=20)
             validation = {"passed": False, "returncode": None, "stdout": "", "stderr": "Validator timed out",
                           "tested_commit": tested_commit, "scope": scope, "validator_sha256": before_hash}
+        validation["sandbox"] = sandbox or {"kind": "local_process"}
         if validation["stdout"]:
             self.log(validation["stdout"])
         if validation["stderr"]:
@@ -182,6 +307,7 @@ class Gate:
 
     def build(self, observation, trigger):
         source, base = observation["source"], observation["base"]
+        self.select_source(source)
         number = len(self.result["attempts"]) + 1
         attempt = {"number": number, "trigger": trigger, "started_at": now(), "source": source,
                    "base": base, "candidate": None, "tree": None, "validator_sha256": self.state["validator_sha256"]}
@@ -191,9 +317,12 @@ class Gate:
         if self.ancestor(source, base):
             attempt["decision"] = "already_integrated"
             self.result.update(decision="already_integrated", reason="source_is_already_in_target",
-                               observed_remote_head=base, observed_source_head=source)
+                               observed_remote_head=base, observed_source_head=source,
+                               decision_label="Принято ранее", integration_confirmed=True)
+            self.status(source, "success", "Принято ранее: " + source[:8] + " уже входит в " + base[:8])
             self.save()
             return False
+        self.status(source, "pending", "Проверяем " + source[:8] + ": база " + base[:8])
         common = self.text("merge-base", base, source)
         changed = self.paths(common, source)
         attempt["source_changed_paths"] = changed
@@ -217,45 +346,50 @@ class Gate:
         if set(candidate_changed) - ALLOWED:
             raise Rejected("scope_violation", "Merged candidate changes the control mechanism")
         self.ordinary_files(candidate)
-        tested_directory, tested_commit, scope = directory, candidate, "merged_candidate"
-        if self.state["mode"] == "pr_only":
-            tested_directory = self.directory / ("source-check-" + str(number))
-            self.git("worktree", "add", "--quiet", "--detach", str(tested_directory), source)
-            tested_commit, scope = source, "source_only_negative_control"
-        validation = self.run_validation(tested_directory, tested_commit, scope)
+        validation = self.run_validation(directory, candidate, "merged_candidate")
         attempt.update(validation=validation, finished_at=now(), decision="prepared" if validation["passed"] else "rejected")
         self.result["validation"] = validation
         if not validation["passed"]:
             raise Rejected("validation_failed", "Trusted acceptance checks rejected the tested snapshot")
         self.state["prepared"] = {"source": source, "base": base, "candidate": candidate,
                                   "tree": tree, "attempt": number, "directory": str(directory)}
-        self.result.update(decision="prepared", reason="checks_passed")
+        self.result.update(decision="prepared", reason="checks_passed", decision_label="Ожидает публикации")
+        self.status(source, "pending", "Ожидает публикации: " + source[:8] + ", база " + base[:8] + ", кандидат " + candidate[:8])
         self.save()
         return True
 
     def prepare(self, args):
-        seconds = self.validate_inputs(args.base_branch, args.source_branch, args.mode, args.hold_seconds)
-        self.state.update(base_branch=args.base_branch, source_branch=args.source_branch, mode=args.mode,
+        seconds = self.validate_inputs(args.base_branch, args.source_branch, args.hold_seconds)
+        self.state.update(base_branch=args.base_branch, source_branch=args.source_branch,
                           hold_seconds=seconds, repo=str(self.repo), trusted_head=self.text("rev-parse", "HEAD"),
-                          validator_sha256=digest(self.oracle), gate_sha256=digest(__file__))
-        self.result.update(base_branch=args.base_branch, source_branch=args.source_branch, mode=args.mode,
-                           negative_control=args.mode == "pr_only", validator_sha256=self.state["validator_sha256"],
+                          validator_sha256=digest(self.oracle), gate_sha256=digest(__file__),
+                          status_module_sha256=digest(Path(__file__).with_name("queue_status.py")))
+        self.result.update(base_branch=args.base_branch, source_branch=args.source_branch,
+                           validator_sha256=self.state["validator_sha256"],
                            gate_sha256=self.state["gate_sha256"], trusted_head=self.state["trusted_head"],
                            max_attempts=MAX_ATTEMPTS)
         self.save()
         self.build(self.observe("prepare"), "initial_prepare")
 
     def accepted(self, reason):
-        self.result.update(decision="accepted", reason=reason, published_candidate=self.state["prepared"]["candidate"])
-        self.result["attempts"][-1]["decision"] = "accepted"
+        candidate = self.state["prepared"]["candidate"]
+        self.result.update(publication_attempted=True, attempted_candidate=candidate)
         try:
             observed = self.observe("after_publication")
             self.result.update(observed_remote_head=observed["base"], observed_source_head=observed["source"],
-                               candidate_in_observed_history=self.ancestor(self.state["prepared"]["candidate"], observed["base"]),
+                               candidate_in_observed_history=self.ancestor(candidate, observed["base"]),
                                source_advanced_after_validation=observed["source"] != self.state["prepared"]["source"])
         except (Rejected, subprocess.TimeoutExpired) as error:
             self.result["observation_error"] = self.clean(error)
-        self.log("ACCEPTED: " + self.state["prepared"]["candidate"])
+            raise Rejected("publication_unconfirmed", "Push outcome requires a later remote observation") from error
+        if not self.result["candidate_in_observed_history"]:
+            raise Rejected("candidate_not_observed", "Remote target does not contain the exact tested candidate")
+        self.result.update(publication_confirmed=True, published_candidate=candidate)
+        self.status(self.state["prepared"]["source"], "success", "Принято: " + self.state["prepared"]["source"][:8]
+                    + ", база " + self.state["prepared"]["base"][:8] + ", опубликован " + candidate[:8])
+        self.result.update(decision="accepted", reason=reason, decision_label="Принято")
+        self.result["attempts"][-1]["decision"] = "accepted"
+        self.log("Принято: " + candidate)
         self.save()
 
     def publish(self):
@@ -279,18 +413,31 @@ class Gate:
                 raise Rejected("candidate_changed", "Immutable candidate no longer matches its recorded tree")
             if not self.ancestor(prepared["base"], prepared["candidate"]):
                 raise Rejected("non_forward_candidate", "Publication must preserve the target history")
-            if self.state["mode"] == "enforce" and self.result["validation"]["tested_commit"] != prepared["candidate"]:
+            if self.result["validation"]["tested_commit"] != prepared["candidate"]:
                 raise Rejected("untested_candidate", "Published SHA must equal the tested SHA")
-            push = self.git("push", "--porcelain", "origin",
-                            prepared["candidate"] + ":refs/heads/" + self.state["base_branch"], check=False)
+            remote = "origin"
+            if os.environ.get("QUEUE_SSH_PUBLISH") == "true":
+                repository = os.environ.get("GITHUB_REPOSITORY", "")
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+                    raise Rejected("invalid_input", "SSH publication requires the GitHub repository identity")
+                remote = "git@github.com:" + repository + ".git"
+            self.result.update(publication_attempted=True, attempted_candidate=prepared["candidate"])
+            self.save()
+            try:
+                push = self.git("push", "--porcelain", remote,
+                                prepared["candidate"] + ":refs/heads/" + self.state["base_branch"], check=False)
+            except (subprocess.TimeoutExpired, OSError) as error:
+                raise Rejected("publication_unconfirmed", "The push response is unavailable") from error
             self.result["attempts"][-1]["push"] = {"returncode": push.returncode,
                                                     "stdout": self.clean(push.stdout), "stderr": self.clean(push.stderr)}
             self.save()
             if push.returncode == 0:
-                self.accepted("published_tested_candidate" if self.state["mode"] == "enforce"
-                              else "negative_control_published_merged_candidate_without_merged_validation")
+                self.accepted("published_tested_candidate")
                 return
-            latest = self.observe("after_rejected_push")
+            try:
+                latest = self.observe("after_rejected_push")
+            except (Rejected, subprocess.TimeoutExpired) as error:
+                raise Rejected("publication_unconfirmed", "Cannot determine whether the attempted push was applied") from error
             if self.ancestor(prepared["candidate"], latest["base"]):
                 self.accepted("accepted_after_ambiguous_push_response")
                 return
@@ -298,6 +445,17 @@ class Gate:
                 raise Rejected("push_rejected", "Ordinary push failed; retry limit reached without rewriting remote history")
             if not self.build(latest, "push_rejected_revalidate"):
                 return
+
+    def finalize(self):
+        if not self.state_path.exists() or not self.result_path.exists():
+            return
+        self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.result = json.loads(self.result_path.read_text(encoding="utf-8"))
+        if self.result["decision"] == "prepared":
+            self.reject("publication_unconfirmed" if self.result.get("publication_attempted") else "interrupted")
+        elif self.result["decision"] in ("error", "rejected") and self.result.get("status_delivery") == "failed":
+            self.status(self.state["active_source"], "error" if self.result["decision"] == "error" else "failure",
+                        self.result.get("description", "Ошибка: итог запуска не доставлен"))
 
     def output(self):
         if os.environ.get("GITHUB_OUTPUT"):
@@ -309,12 +467,11 @@ class Gate:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("prepare", "publish"))
+    parser.add_argument("phase", choices=("prepare", "publish", "finalize"))
     parser.add_argument("--repo", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--base-branch", default="")
     parser.add_argument("--source-branch", default="")
-    parser.add_argument("--mode", default="enforce")
     parser.add_argument("--hold-seconds", default="0")
     args = parser.parse_args()
     gate = Gate(args.repo, args.state_dir)
@@ -322,15 +479,23 @@ def main():
     try:
         if args.phase == "prepare":
             gate.prepare(args)
-        else:
+        elif args.phase == "publish":
             gate.publish()
+        else:
+            gate.finalize()
     except Rejected as error:
         gate.reject(error.reason, str(error))
+        exit_code = 1
+    except StatusError as error:
+        gate.reject("status_delivery_failed", str(error))
+        exit_code = 1
     except Exception as error:
         gate.reject("internal_error", str(error))
         gate.log(traceback.format_exc())
         exit_code = 1
     gate.output()
+    if gate.result["decision"] not in ("accepted", "already_integrated", "prepared"):
+        exit_code = 1
     return exit_code
 
 

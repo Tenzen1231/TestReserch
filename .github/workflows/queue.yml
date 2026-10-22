@@ -1,25 +1,18 @@
-name: Council CI integration gate
-run-name: '${{ inputs.base_branch }} <- ${{ inputs.source_branch }} (${{ inputs.mode }})'
+name: Очередь изменений
+run-name: '${{ inputs.base_branch }} <- ${{ inputs.source_branch }}'
 
 on:
   workflow_dispatch:
     inputs:
       base_branch:
-        description: 'Target test branch (feature/* only)'
+        description: 'Общая ветка назначения (feature/*)'
         required: true
         type: string
+        default: feature/team-shared
       source_branch:
-        description: 'Submission branch (feature/* only)'
+        description: 'Ветка участника (feature/*)'
         required: true
         type: string
-      mode:
-        description: 'enforce validates the merged candidate; pr_only is an intentionally unsafe control'
-        required: true
-        type: choice
-        options:
-          - enforce
-          - pr_only
-        default: enforce
       hold_seconds:
         description: 'Pause before publication for controlled concurrency tests (0..90)'
         required: true
@@ -27,7 +20,8 @@ on:
         default: 0
 
 permissions:
-  contents: write
+  contents: read
+  statuses: write
 
 concurrency:
   group: council-ci-gate-${{ inputs.base_branch }}
@@ -38,16 +32,16 @@ jobs:
   integrate:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: queue-publisher
     timeout-minutes: 15
     env:
       BASE_BRANCH: ${{ inputs.base_branch }}
       SOURCE_BRANCH: ${{ inputs.source_branch }}
-      GATE_MODE: ${{ inputs.mode }}
       HOLD_SECONDS: ${{ inputs.hold_seconds }}
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out trusted gate and oracle
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -55,6 +49,9 @@ jobs:
 
       - name: Initialize gate state
         run: echo "STATE_DIR=$RUNNER_TEMP/council-ci-gate" >> "$GITHUB_ENV"
+
+      - name: Prepare isolated validator image
+        run: docker pull python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2
 
       - name: Prepare and validate candidate
         id: prepare
@@ -64,7 +61,7 @@ jobs:
           python queue_gate.py prepare
           --repo "$GITHUB_WORKSPACE" --state-dir "$STATE_DIR"
           --base-branch "$BASE_BRANCH" --source-branch "$SOURCE_BRANCH"
-          --mode "$GATE_MODE" --hold-seconds "$HOLD_SECONDS"
+          --hold-seconds "$HOLD_SECONDS"
 
       - name: Hold for concurrent changes
         if: steps.prepare.outputs.ready == 'true'
@@ -81,7 +78,30 @@ jobs:
         if: steps.prepare.outputs.ready == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python queue_gate.py publish --repo "$GITHUB_WORKSPACE" --state-dir "$STATE_DIR"
+          QUEUE_DEPLOY_KEY: ${{ secrets.QUEUE_DEPLOY_KEY }}
+          QUEUE_SSH_PUBLISH: 'true'
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, urllib.request
+          with urllib.request.urlopen('https://api.github.com/meta', timeout=30) as response:
+              keys = json.load(response)['ssh_keys']
+          if not keys or any('\n' in key or '\r' in key for key in keys):
+              raise SystemExit('GitHub did not return valid SSH host keys')
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'github_known_hosts').write_text(
+              ''.join('github.com ' + key + '\n' for key in keys), encoding='utf-8')
+          PY
+          eval "$(ssh-agent -s)" >/dev/null
+          trap 'ssh-agent -k >/dev/null' EXIT
+          printf '%s\n' "$QUEUE_DEPLOY_KEY" | ssh-add - >/dev/null
+          unset QUEUE_DEPLOY_KEY
+          export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/github_known_hosts"
+          python queue_gate.py publish --repo "$GITHUB_WORKSPACE" --state-dir "$STATE_DIR"
+
+      - name: Finish pending source status
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python queue_gate.py finalize --repo "$GITHUB_WORKSPACE" --state-dir "$STATE_DIR"
 
       - name: Summarize decision
         if: always()
@@ -93,20 +113,21 @@ jobs:
               raise SystemExit('Gate did not produce result.json; inspect preceding setup errors.')
           result = json.loads(path.read_text())
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
-              stream.write('## ' + result['decision'].upper() + '\n\n')
-              if result.get('negative_control'):
-                  stream.write('**INTENTIONALLY UNSAFE NEGATIVE CONTROL: merged result was not validated.**\n\n')
+              stream.write('## ' + result.get('decision_label', 'Ошибка запуска') + '\n\n')
+              stream.write(result.get('description', result['reason']) + '\n\n')
               for key in ('reason', 'source_branch', 'base_branch', 'source', 'base', 'candidate', 'tree',
                           'published_candidate', 'observed_remote_head', 'validator_sha256'):
                   if key in result:
                       stream.write(f'- {key}: `{result[key]}`\n')
-              stream.write(f"- Candidate attempts: {len(result['attempts'])}\n")
-              stream.write('\nExpected rejection is a gate decision; the workflow stays green so evidence is uploaded.\n')
+              stream.write(f"- Попыток проверки: {len(result['attempts'])}\n")
+              stream.write('\nСтатус участника относится к указанному source SHA и целевой ветке. '
+                           'Отклонение или ошибка делают запуск красным; доказательства сохраняются всегда. '
+                           'Информационный статус не заменяет серверные ограничения публикации.\n')
           PY
 
       - name: Upload queue evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: queue-evidence
           path: |
