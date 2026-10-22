@@ -4,23 +4,25 @@ from math import ceil
 from money import price_units
 
 
-def format_total(amount, prefix='', suffix='', thousands_separator='', show_plus=False, decimal_separator='.'):
-    money_value = Decimal(price_units(amount)) / 100
-    integer_part, fraction_part = f'{abs(money_value):.2f}'.split('.')
+def format_total(amount, prefix='', suffix='', decimal_separator='.', trim_zeros=False, thousands_separator='', show_plus=False):
+    rounded_amount = Decimal(price_units(amount)) / 100
+    whole_digits, fraction_digits = f'{abs(rounded_amount):.2f}'.split('.')
     if thousands_separator:
-        remaining = integer_part
-        groups = []
-        width = 3
-        while remaining:
-            groups.append(remaining[-width:])
-            remaining = remaining[:-width]
-        integer_part = thousands_separator.join(reversed(groups))
-    number_text = integer_part + decimal_separator + fraction_part
-    if money_value < 0:
-        number_text = '-' + number_text
-    elif money_value > 0 and show_plus:
-        number_text = '+' + number_text
-    return prefix + number_text + suffix
+        remaining_digits = whole_digits
+        pieces = []
+        chunk_size = 3
+        while remaining_digits:
+            pieces.append(remaining_digits[-chunk_size:])
+            remaining_digits = remaining_digits[:-chunk_size]
+        whole_digits = thousands_separator.join(reversed(pieces))
+    if trim_zeros:
+        fraction_digits = fraction_digits.rstrip('0')
+    formatted = whole_digits + (decimal_separator + fraction_digits if fraction_digits else '')
+    if rounded_amount < 0:
+        formatted = '-' + formatted
+    elif rounded_amount > 0 and show_plus:
+        formatted = '+' + formatted
+    return prefix + formatted + suffix
 
 
 def format_currency_total(amount):

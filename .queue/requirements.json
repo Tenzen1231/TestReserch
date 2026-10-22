@@ -1,1 +1,1 @@
-{"accepted": ["currency", "decimal-separator", "discount", "explicit-sign", "fee", "prefix", "round-up", "suffix", "thousands"], "version": 1}
+{"accepted": ["currency", "decimal-separator", "discount", "explicit-sign", "fee", "prefix", "round-up", "suffix", "thousands", "trim-zeros"], "version": 1}
