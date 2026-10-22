@@ -15,7 +15,7 @@ from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from queue_gate import Gate, VALIDATION_IMAGE
-from queue_status import CommitStatuses
+from queue_status import CommitStatuses, StatusError
 
 
 PRODUCT = Path(__file__).resolve().parents[1]
@@ -26,6 +26,9 @@ class StatusAPI(ThreadingHTTPServer):
         self.items = {}
         self.posts = []
         self.fail_states = set()
+        self.fail_posts = 0
+        self.fail_gets = 0
+        self.gets = 0
         self.lose_next_response = False
         owner = self
 
@@ -42,12 +45,21 @@ class StatusAPI(ThreadingHTTPServer):
                 self.wfile.write(data)
 
             def do_GET(self):
+                owner.gets += 1
+                if owner.fail_gets:
+                    owner.fail_gets -= 1
+                    self.reply(502, {"message": "Injected transient read failure"})
+                    return
                 sha = urlsplit(self.path).path.split("/")[5]
                 self.reply(200, list(reversed(owner.items.get(sha, []))))
 
             def do_POST(self):
                 sha = urlsplit(self.path).path.split("/")[5]
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if owner.fail_posts:
+                    owner.fail_posts -= 1
+                    self.reply(500, {"message": "Injected transient write failure"})
+                    return
                 if body["state"] in owner.fail_states:
                     self.reply(503, {"message": "Injected unavailable status service"})
                     return
@@ -228,6 +240,35 @@ sys.exit(queue_gate.main())
         self.assertNotEqual(client.context("feature/A").casefold(), client.context("feature/a").casefold())
         client.send(self.source, "feature/other", "pending", "Проверяем")
         self.assertEqual(len(self.api.posts), 2)
+
+    def test_transient_read_and_write_failures_are_retried_without_duplicates(self):
+        client = CommitStatuses("fixture/repository", "local-fixture-token", "42", self.api.url)
+        with patch("queue_status.RETRY_DELAYS", (0, 0)):
+            self.api.fail_gets = 2
+            self.api.fail_posts = 2
+            event = client.send(self.source, "feature/team", "pending", "Проверяем")
+            self.assertEqual((event["deduplicated"], event["post_attempts"]), (False, 3))
+            self.assertEqual(len(self.api.posts), 1)
+            self.api.fail_posts = 3
+            with self.assertRaises(StatusError) as error:
+                client.send(self.source, "feature/team", "success", "Принято")
+            self.assertTrue(error.exception.transient)
+            self.assertEqual(len(self.api.posts), 1)
+
+    def test_lost_pending_status_does_not_stop_the_request(self):
+        self.env["GITHUB_API_URL"] = self.api.url
+        self.api.fail_states.add("pending")
+        with patch.dict(os.environ, self.env, clear=True), patch("queue_status.RETRY_DELAYS", (0, 0)):
+            gate = Gate(self.trusted, self.root / "lost-pending")
+            import argparse
+            gate.prepare(argparse.Namespace(base_branch="feature/team", source_branch="feature/source",
+                                            hold_seconds="0", requirement="baseline"))
+            gate.publish()
+        self.assertEqual(gate.result["decision"], "accepted")
+        self.assertEqual(self.remote_head(), gate.result["published_candidate"])
+        self.assertTrue(gate.result["status_errors"])
+        self.assertTrue(all(item["state"] == "pending" for item in gate.result["status_errors"]))
+        self.assertEqual(self.api.items[self.source][-1]["state"], "success")
 
     def test_finalize_closes_pending_and_unsafe_mode_is_not_a_cli_option(self):
         self.assertEqual(self.phase("prepare")[0], 0)

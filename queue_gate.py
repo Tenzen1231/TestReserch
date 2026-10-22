@@ -129,7 +129,17 @@ class Gate:
             self.result["status_delivery"] = "disabled_local"
             self.save()
             return
-        event = self.statuses.send(sha, self.state["base_branch"], value, description)
+        try:
+            event = self.statuses.send(sha, self.state["base_branch"], value, description)
+        except StatusError as error:
+            if value != "pending":
+                raise
+            # Progress labels are UI feedback only: their loss must not stop the
+            # request. Terminal states still fail closed and are retried by finalize.
+            self.result.setdefault("status_errors", []).append(
+                {"state": value, "sha": sha, "description": description, "error": str(error), "at": now()})
+            self.save()
+            return
         event.update(base=self.result.get("base"), candidate=self.result.get("candidate"),
                      target_branch=self.state["base_branch"], at=now())
         if not any(item.get("id") == event.get("id") for item in self.result.setdefault("status_events", [])):
@@ -409,6 +419,12 @@ class Gate:
         return {
             "allowed_paths": sorted(ALLOWED),
             "requirements": {key: CONTRACTS[key] for key in self.state["requirements"]},
+            # The same literal oracle the candidate must pass; it is data for the
+            # model, while the trusted validator stays outside its reach.
+            "acceptance_examples": [{"check": name, "call": module + "." + function + "(" + ", ".join(
+                [repr(arg) for arg in args] + [key + "=" + repr(value) for key, value in kwargs.items()]) + ")",
+                "expected": expected} for name, module, function, args, kwargs, expected
+                in contract_cases(self.state["requirements"])],
             "baseline_requirement": "receipt.format_total and email_receipt.format_email_total return original ruble amounts with two decimals. Preserve unrelated enabled feature flags; all three flags simultaneously enabled are incompatible.",
             "new_requirement": self.state["requirement"],
             "refusal": refusal,
@@ -467,6 +483,7 @@ class Gate:
             raise Rejected("repair_rerun_blocked", "A job rerun cannot reset the automatic repair budget")
         refusal = {"reason": error.reason, "validation": self.result.get("validation")}
         while self.state["repair_calls_reserved"] < MAX_REPAIRS:
+            self.status(source, "pending", "Исправляем автоматически через DeepSeek (не более 2 попыток)")
             self.check_pr("before_repair_reservation")
             reservation = None
             if self.state["durable_budget"]:
@@ -491,8 +508,7 @@ class Gate:
                 record["budget_reservation"] = reservation
             self.result.setdefault("repairs", []).append(record)
             self.save()
-            ordinal = reservation["ordinal"] if reservation else record["number"]
-            self.status(source, "pending", "Исправляем автоматически: попытка " + str(ordinal) + "/2")
+            # No GitHub status call between the reservation and the model request.
             try:
                 self.check_pr("before_router_post")
                 client = RouterRepairClient.from_environment(allowed_paths=ALLOWED)
@@ -716,7 +732,24 @@ class Gate:
             self.status(self.state["active_source"], "error" if self.result["decision"] == "error" else "failure",
                         self.result.get("description", "Ошибка: итог запуска не доставлен"))
 
+    def repair_accounting(self):
+        repairs = self.result.get("repairs", [])
+        metadata = [item.get("metadata") or {} for item in repairs]
+        return {"reserved": len(repairs),
+                "request_sent": sum(1 for item in metadata if item.get("request_sent")),
+                "response_received": sum(1 for item in metadata if item.get("response_received")),
+                "proposed": sum(1 for item in repairs if item.get("state") in ("proposed", "validated")
+                                or item.get("patch_sha256")),
+                "validated": sum(1 for item in repairs if item.get("state") == "validated"),
+                "published": int(self.result.get("decision") == "accepted"
+                                 and any(item.get("state") == "validated"
+                                         and item.get("candidate") == self.result.get("published_candidate")
+                                         for item in repairs))}
+
     def output(self):
+        if self.result_path.exists():
+            self.result["repair_accounting"] = self.repair_accounting()
+            self.save()
         if os.environ.get("GITHUB_OUTPUT"):
             with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
                 stream.write("ready=" + str(self.result["decision"] == "prepared").lower() + "\n")

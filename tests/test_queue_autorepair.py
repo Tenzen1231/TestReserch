@@ -141,6 +141,45 @@ class QueueAutorepairTests(unittest.TestCase):
         self.assertEqual(observed, [1, 2])
         self.assertEqual(self.remote_head(), old)
 
+    def test_pending_status_outage_neither_burns_reservation_nor_blocks_repair(self):
+        self.accept_discount()
+        self.branch("feature/fee", self.start, {"money.py": FEE})
+        gate = self.gate("status-outage", "feature/fee", "fee")
+        self.api.fail_states.add("pending")
+        order = []
+        model = Mock()
+        def propose(context):
+            order.append("post")
+            self.assertIn("combined:0", [item["check"] for item in context["acceptance_examples"]])
+            return dict(self.proposal(COMBINED), metadata={"request_sent": True, "response_received": True})
+        model.propose.side_effect = propose
+        def reserve(*args, **kwargs):
+            order.append("reserve")
+            return {"ordinal": 1, "ledger_commit": "1" * 40}
+        with patch.dict(os.environ, QUEUE_DURABLE_BUDGET="true"), patch("queue_status.RETRY_DELAYS", (0, 0)),                 patch("queue_gate.reserve_budget", side_effect=reserve),                 patch("queue_gate.RouterRepairClient.from_environment", return_value=model):
+            gate.prepare(gate.args)
+            gate.publish()
+        self.assertEqual(order, ["reserve", "post"])
+        self.assertEqual(gate.result["decision"], "accepted")
+        self.assertTrue(any("DeepSeek" in item["description"] for item in gate.result["status_errors"]))
+        gate.output()
+        self.assertEqual(gate.result["repair_accounting"], {"reserved": 1, "request_sent": 1, "response_received": 1,
+                                                            "proposed": 1, "validated": 1, "published": 1})
+
+    def test_reservation_without_request_is_not_counted_as_a_model_call(self):
+        self.accept_discount()
+        self.branch("feature/fee", self.start, {"money.py": FEE})
+        gate = self.gate("not-sent", "feature/fee", "fee")
+        with patch("queue_gate.RouterRepairClient.from_environment",
+                   side_effect=RepairError("repair_missing_credentials", "No key")):
+            with self.assertRaises(Rejected) as error:
+                gate.prepare(gate.args)
+        self.assertEqual(error.exception.reason, "repair_exhausted")
+        gate.reject(error.exception.reason)
+        gate.output()
+        self.assertEqual(gate.result["repair_accounting"]["reserved"], 2)
+        self.assertEqual(gate.result["repair_accounting"]["request_sent"], 0)
+
     def test_job_rerun_does_not_reset_budget(self):
         self.accept_discount()
         self.branch("feature/fee", self.start, {"money.py": FEE})

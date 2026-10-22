@@ -8,13 +8,20 @@ import hashlib
 import json
 import os
 import re
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
+MAX_REQUEST_ATTEMPTS = 3
+RETRY_DELAYS = (2, 5)
+
+
 class StatusError(RuntimeError):
-    pass
+    def __init__(self, message, transient=False):
+        super().__init__(message)
+        self.transient = transient
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -52,7 +59,7 @@ class CommitStatuses:
         suffix = hashlib.sha256(target.encode("utf-8")).hexdigest()[:12]
         return "council/" + target[:65] + "#" + suffix
 
-    def request(self, method, path, payload=None):
+    def request_once(self, method, path, payload=None):
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = Request(self.api_url + path, data=data, method=method,
                           headers={"Accept": "application/vnd.github+json", "Authorization": "Bearer " + self.token,
@@ -63,9 +70,21 @@ class CommitStatuses:
                     return None
                 return json.load(response)
         except HTTPError as error:
-            raise StatusError("GitHub status API returned HTTP " + str(error.code)) from None
+            raise StatusError("GitHub status API returned HTTP " + str(error.code),
+                              transient=error.code >= 500 or error.code == 429) from None
         except (URLError, TimeoutError, OSError, ValueError):
-            raise StatusError("GitHub status API response is unavailable or invalid") from None
+            raise StatusError("GitHub status API response is unavailable or invalid", transient=True) from None
+
+    def request(self, method, path, payload=None):
+        # Only reads are repeated here; a POST may have been applied before its
+        # response was lost, so its callers read back before any repetition.
+        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                return self.request_once(method, path, payload)
+            except StatusError as error:
+                if method != "GET" or not error.transient or attempt == MAX_REQUEST_ATTEMPTS:
+                    raise
+                time.sleep(RETRY_DELAYS[attempt - 1])
 
     def latest(self, sha, context):
         page = 1
@@ -93,15 +112,19 @@ class CommitStatuses:
         previous = self.latest(sha, body["context"])
         if matches(previous):
             return dict(body, sha=sha, id=previous.get("id"), deduplicated=True)
-        try:
-            posted = self.request("POST", "/repos/" + self.repository + "/statuses/" + sha, body)
-        except StatusError:
-            # A lost response may follow a successful POST. Read before retrying
-            # so a repeated phase does not create another identical status.
-            observed = self.latest(sha, body["context"])
-            if matches(observed):
-                return dict(body, sha=sha, id=observed.get("id"), deduplicated=True)
-            raise
+        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                posted = self.request("POST", "/repos/" + self.repository + "/statuses/" + sha, body)
+                break
+            except StatusError as error:
+                # A lost response may follow a successful POST. Read before
+                # repeating so a retry does not create another identical status.
+                observed = self.latest(sha, body["context"])
+                if matches(observed):
+                    return dict(body, sha=sha, id=observed.get("id"), deduplicated=True, post_attempts=attempt)
+                if not error.transient or attempt == MAX_REQUEST_ATTEMPTS:
+                    raise
+                time.sleep(RETRY_DELAYS[attempt - 1])
         if not matches(posted):
             raise StatusError("GitHub did not confirm the requested status")
-        return dict(body, sha=sha, id=posted.get("id"), deduplicated=False)
+        return dict(body, sha=sha, id=posted.get("id"), deduplicated=False, post_attempts=attempt)

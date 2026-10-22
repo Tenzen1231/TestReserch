@@ -197,7 +197,13 @@ jobs:
                   if key in result:
                       stream.write(f'- {key}: `{result[key]}`\n')
               stream.write(f"- Попыток проверки: {len(result['attempts'])}\n")
-              stream.write(f"- Попыток ремонта ИИ: {len(result.get('repairs', []))}/2\n")
+              accounting = result.get('repair_accounting') or {}
+              stream.write(f"- Резервов ремонта ИИ: {len(result.get('repairs', []))}/2\n")
+              stream.write(f"- Запросов к модели отправлено: {accounting.get('request_sent', 0)}, "
+                           f"ответов получено: {accounting.get('response_received', 0)}, "
+                           f"патчей предложено: {accounting.get('proposed', 0)}, "
+                           f"проверено: {accounting.get('validated', 0)}, "
+                           f"опубликовано: {accounting.get('published', 0)}\n")
               stream.write(f"- Проверок Mergiraf: {len(result.get('structural_repairs', []))}\n")
               if result.get('dispatcher_run_id'):
                   stream.write(f"- Автоматическое событие: {result['event_action']}, PR #{result['pr_number']}, диспетчер {result['dispatcher_run_id']}\n")

@@ -3,9 +3,10 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 
 from acceptance import CONTRACTS
-from queue_status import CommitStatuses, StatusError
+from queue_status import CommitStatuses, StatusError, MAX_REQUEST_ATTEMPTS, RETRY_DELAYS
 
 
 TARGET = "feature/team-shared"
@@ -79,9 +80,19 @@ def dispatch(event, api, run_id):
     request = guard(api, request)
     inputs = {key: str(value) for key, value in request.items()}
     inputs.update(dispatcher_run_id=str(run_id), event_action=action, hold_seconds="0")
-    api.request("POST", "/repos/" + api.repository + "/actions/workflows/queue.yml/dispatches",
-                {"ref": "main", "inputs": inputs})
-    return {"decision": "dispatched", "event_action": action,
+    # A repeated dispatch after a lost response is harmless: queue runs are
+    # serialized, an integrated source is reported as already accepted and the
+    # durable ledger bounds model calls per source SHA, not per run.
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            api.request("POST", "/repos/" + api.repository + "/actions/workflows/queue.yml/dispatches",
+                        {"ref": "main", "inputs": inputs})
+            break
+        except StatusError as error:
+            if not error.transient or attempt == MAX_REQUEST_ATTEMPTS:
+                raise
+            time.sleep(RETRY_DELAYS[attempt - 1])
+    return {"decision": "dispatched", "event_action": action, "dispatch_attempts": attempt,
             "dispatcher_run_id": str(run_id), **request}
 
 

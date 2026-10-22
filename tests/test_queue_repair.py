@@ -186,6 +186,28 @@ class QueueRepairTests(unittest.TestCase):
                                                                                     "tool_calls": [{"id": "no"}]}}])
         self.fails("repair_incomplete_response")
 
+    def test_incomplete_response_keeps_finish_reason_and_shape_but_no_provider_text(self):
+        thinking = "private chain of thought " * 40
+        self.api.body = envelope(choices=[{"finish_reason": "length", "message": {
+            "role": "assistant", "content": "", "reasoning": thinking}}],
+            usage={"completion_tokens": 8192, "completion_tokens_details": {"reasoning_tokens": 8192}})
+        metadata = self.fails("repair_incomplete_response").metadata
+        self.assertEqual(metadata["response_shape"], {
+            "finish_reason": "length", "message_keys": ["content", "reasoning", "role"],
+            "content_type": "str", "content_chars": 0, "reasoning_chars": len(thinking)})
+        self.assertEqual(metadata["usage"]["completion_tokens_details"]["reasoning_tokens"], 8192)
+        self.assertNotIn("private chain", json.dumps(metadata))
+        self.api.body = envelope(choices=[{"finish_reason": "x" * 80, "message": {"content": None}}])
+        shape = self.fails("repair_incomplete_response").metadata["response_shape"]
+        self.assertEqual((shape["finish_reason"], shape["content_type"]), ("unrecognized", "NoneType"))
+
+    def test_request_parameters_are_the_recorded_fixed_parameters(self):
+        self.client.propose(self.context)
+        body = json.loads(self.api.requests[-1]["body"])
+        self.assertEqual(body["model"], queue_repair.MODEL)
+        self.assertEqual({key: body[key] for key in queue_repair.REQUEST_PARAMETERS}, queue_repair.REQUEST_PARAMETERS)
+        self.assertEqual(set(body), {"model", "messages", *queue_repair.REQUEST_PARAMETERS})
+
     def test_model_mismatch_is_rejected_and_missing_identity_is_explicit(self):
         self.api.body = envelope(model="deepseek/different-model")
         self.fails("repair_model_mismatch")
@@ -249,13 +271,20 @@ class QueueRepairTests(unittest.TestCase):
             self.assertEqual(metadata["usage"]["total_tokens"], 130)
             self.assertGreaterEqual(metadata["elapsed_seconds"], 0)
             self.assertEqual(set(metadata), {"request_sha256", "response_sha256", "id", "requested_model",
-                                              "returned_model", "usage", "elapsed_seconds"})
+                                              "returned_model", "usage", "elapsed_seconds", "request_parameters",
+                                              "request_sent", "response_received", "http_status",
+                                              "response_bytes", "response_shape"})
+            self.assertEqual((metadata["request_sent"], metadata["response_received"], metadata["http_status"]),
+                             (True, True, 200))
+            self.assertEqual(metadata["response_shape"]["finish_reason"], "stop")
         self.assertEqual(len(self.api.requests), 2)
 
     def test_failed_transport_and_untrusted_envelope_keep_only_valid_metadata(self):
         self.api.drop_response = True
         metadata = self.fails("repair_transport_error").metadata
-        self.assertEqual(set(metadata), {"request_sha256", "requested_model", "elapsed_seconds"})
+        self.assertEqual(set(metadata), {"request_sha256", "requested_model", "elapsed_seconds",
+                                          "request_parameters", "request_sent", "response_received"})
+        self.assertEqual((metadata["request_sent"], metadata["response_received"]), (True, False))
         self.assertEqual(metadata["request_sha256"], hashlib.sha256(self.api.requests[-1]["body"]).hexdigest())
         self.api.drop_response = False
         for body, reason in ((envelope(id=FIXTURE_KEY), "repair_sensitive_data"),
@@ -263,7 +292,10 @@ class QueueRepairTests(unittest.TestCase):
                              (b"invalid provider body", "repair_invalid_response")):
             self.api.body = body
             metadata = self.fails(reason).metadata
-            self.assertEqual(set(metadata), {"request_sha256", "response_sha256", "requested_model", "elapsed_seconds"})
+            self.assertEqual(set(metadata), {"request_sha256", "response_sha256", "requested_model", "elapsed_seconds",
+                                              "request_parameters", "request_sent", "response_received",
+                                              "http_status", "response_bytes"})
+            self.assertTrue(metadata["response_received"])
             self.assertEqual(metadata["response_sha256"], hashlib.sha256(body).hexdigest())
         self.api.code = 503
         self.api.body = FIXTURE_KEY.encode()
