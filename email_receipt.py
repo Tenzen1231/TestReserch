@@ -1,3 +1,4 @@
+# Второй круг: bob, прежние фичи сохраняются.
 from receipt import format_total
 
 
