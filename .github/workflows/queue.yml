@@ -27,6 +27,15 @@ on:
           - prefix
           - suffix
           - round-up
+          - decimal-separator
+          - thousands
+          - explicit-sign
+          - trim-zeros
+          - grouping-pattern
+          - negative-parentheses
+          - minimum-fraction
+          - grouping-threshold
+          - zero-text
       pr_number:
         description: 'Номер открытого PR (заполняет автоматический диспетчер)'
         required: true
