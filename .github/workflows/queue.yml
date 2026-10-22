@@ -44,7 +44,6 @@ jobs:
       SOURCE_BRANCH: ${{ inputs.source_branch }}
       GATE_MODE: ${{ inputs.mode }}
       HOLD_SECONDS: ${{ inputs.hold_seconds }}
-      STATE_DIR: ${{ runner.temp }}/council-ci-gate
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out trusted gate and oracle
@@ -53,6 +52,9 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Initialize gate state
+        run: echo "STATE_DIR=$RUNNER_TEMP/council-ci-gate" >> "$GITHUB_ENV"
 
       - name: Prepare and validate candidate
         id: prepare
