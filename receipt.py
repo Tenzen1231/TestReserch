@@ -4,20 +4,20 @@ from math import ceil
 from money import price_units
 
 
-def format_total(amount, prefix='', suffix='', thousands_separator='', show_plus=False, decimal_separator='.'):
+def format_total(amount, prefix='', suffix='', decimal_separator='.', thousands_separator='', show_plus=False, negative_style='minus'):
     money_value = Decimal(price_units(amount)) / 100
-    integer_part, fraction_part = f'{abs(money_value):.2f}'.split('.')
+    integer_part, decimal_part = f'{abs(money_value):.2f}'.split('.')
     if thousands_separator:
-        remaining = integer_part
-        groups = []
-        width = 3
-        while remaining:
-            groups.append(remaining[-width:])
-            remaining = remaining[:-width]
-        integer_part = thousands_separator.join(reversed(groups))
-    number_text = integer_part + decimal_separator + fraction_part
+        ungrouped = integer_part
+        chunks = []
+        chunk_width = 3
+        while ungrouped:
+            chunks.append(ungrouped[-chunk_width:])
+            ungrouped = ungrouped[:-chunk_width]
+        integer_part = thousands_separator.join(reversed(chunks))
+    number_text = integer_part + (decimal_separator + decimal_part if decimal_part else '')
     if money_value < 0:
-        number_text = '-' + number_text
+        number_text = '(' + number_text + ')' if negative_style == 'parentheses' else '-' + number_text
     elif money_value > 0 and show_plus:
         number_text = '+' + number_text
     return prefix + number_text + suffix
