@@ -4,9 +4,9 @@ from math import ceil
 from money import price_units
 
 
-def format_total(amount, prefix='', suffix='', thousands_separator='', show_plus=False):
+def format_total(amount, prefix='', suffix='', thousands_separator='', show_plus=False, decimal_separator='.'):
     money_value = Decimal(price_units(amount)) / 100
-    integer_part, decimal_part = f'{abs(money_value):.2f}'.split('.')
+    integer_part, fraction_part = f'{abs(money_value):.2f}'.split('.')
     if thousands_separator:
         remaining = integer_part
         groups = []
@@ -15,7 +15,7 @@ def format_total(amount, prefix='', suffix='', thousands_separator='', show_plus
             groups.append(remaining[-width:])
             remaining = remaining[:-width]
         integer_part = thousands_separator.join(reversed(groups))
-    number_text = integer_part + ('.' + decimal_part if decimal_part else '')
+    number_text = integer_part + decimal_separator + fraction_part
     if money_value < 0:
         number_text = '-' + number_text
     elif money_value > 0 and show_plus:
