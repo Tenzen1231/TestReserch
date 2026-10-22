@@ -87,9 +87,11 @@ class QueueStatusTests(unittest.TestCase):
         self.git(self.seed, "init", "-b", "main")
         self.git(self.seed, "config", "user.name", "Council tests")
         self.git(self.seed, "config", "user.email", "tests@localhost")
-        for name in ("queue_gate.py", "queue_status.py", "acceptance.py", "money.py", "receipt.py",
+        for name in ("queue_gate.py", "queue_status.py", "queue_repair.py", "acceptance.py", "money.py", "receipt.py",
                      "email_receipt.py", "feature_a.py", "feature_b.py", "feature_c.py"):
             shutil.copy2(PRODUCT / name, self.seed / name)
+        (self.seed / ".queue").mkdir()
+        shutil.copy2(PRODUCT / ".queue/requirements.json", self.seed / ".queue/requirements.json")
         self.git(self.seed, "add", ".")
         self.git(self.seed, "commit", "-m", "test: создана исходная модель")
         self.git(self.seed, "branch", "feature/team")
