@@ -1,1 +1,1 @@
-{"accepted": ["currency", "discount", "fee", "prefix"], "version": 1}
+{"accepted": ["currency", "discount", "fee", "prefix", "round-up"], "version": 1}

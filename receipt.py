@@ -1,4 +1,5 @@
 from decimal import Decimal
+from math import ceil
 from money import price_units
 
 
@@ -9,3 +10,7 @@ def format_total(amount, prefix=''):
 
 def format_currency_total(amount):
     return format_total(amount) + ' RUB'
+
+
+def round_up_total(amount):
+    return ceil(float(amount))
