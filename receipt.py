@@ -4,8 +4,15 @@ from math import ceil
 from money import price_units
 
 
-def format_total(amount, prefix='', suffix=''):
-    return prefix + f"{Decimal(price_units(amount)) / 100:.2f}" + suffix
+def format_total(amount, prefix='', suffix='', show_plus=False):
+    money_value = Decimal(price_units(amount)) / 100
+    integer_part, decimal_part = f'{abs(money_value):.2f}'.split('.')
+    number_text = integer_part + ('.' + decimal_part if decimal_part else '')
+    if money_value < 0:
+        number_text = '-' + number_text
+    elif money_value > 0 and show_plus:
+        number_text = '+' + number_text
+    return prefix + number_text + suffix
 
 
 def format_currency_total(amount):
