@@ -1,3 +1,4 @@
+# Второй круг: alice, прежние фичи сохраняются.
 from decimal import Decimal
 from math import ceil
 from money import price_units
