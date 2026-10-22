@@ -59,6 +59,8 @@ class CommitStatuses:
                                    "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"})
         try:
             with self.opener.open(request, timeout=20) as response:
+                if response.status == 204:
+                    return None
                 return json.load(response)
         except HTTPError as error:
             raise StatusError("GitHub status API returned HTTP " + str(error.code)) from None

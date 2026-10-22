@@ -12,6 +12,8 @@ from unittest.mock import Mock, patch
 from acceptance import REGISTRY_PATH
 from queue_gate import Gate, Rejected
 from queue_repair import RepairError
+from queue_structural import StructuralError
+from queue_budget import BudgetError
 import test_queue_status as fixture
 
 
@@ -174,6 +176,109 @@ class QueueAutorepairTests(unittest.TestCase):
         with self.assertRaises(Rejected) as error:
             gate.prepare(gate.args)
         self.assertEqual(error.exception.reason, "requirement_not_recorded")
+
+    def test_structural_resolution_is_validated_before_ai_and_can_avoid_ai(self):
+        self.accept_discount()
+        self.branch("feature/fee", self.start, {"money.py": FEE})
+        gate = self.gate("structural", "feature/fee", "fee")
+        structural = Mock()
+        structural.propose.return_value = self.proposal(COMBINED)
+        with patch.dict(os.environ, QUEUE_STRUCTURAL_REPAIR="true"), \
+                patch("queue_gate.StructuralRepairClient.from_environment", return_value=structural), \
+                patch("queue_gate.RouterRepairClient.from_environment") as model:
+            gate.prepare(gate.args)
+            gate.publish()
+        model.assert_not_called()
+        self.assertEqual(gate.result["decision"], "accepted")
+        self.assertEqual(gate.result["structural_repairs"][0]["state"], "validated")
+        self.assertEqual(structural.propose.call_args.args[0]["conflict_paths"], ["money.py"])
+
+    def test_structural_lost_feature_is_rejected_and_model_must_preserve_both(self):
+        self.accept_discount()
+        self.branch("feature/fee", self.start, {"money.py": FEE})
+        gate = self.gate("structural-loss", "feature/fee", "fee")
+        structural, model = Mock(), Mock()
+        structural.propose.return_value = self.proposal(DISCOUNT)
+        model.propose.return_value = self.proposal(COMBINED)
+        with patch.dict(os.environ, QUEUE_STRUCTURAL_REPAIR="true"), \
+                patch("queue_gate.StructuralRepairClient.from_environment", return_value=structural), \
+                patch("queue_gate.RouterRepairClient.from_environment", return_value=model):
+            gate.prepare(gate.args)
+            gate.publish()
+        self.assertEqual(gate.result["structural_repairs"][0]["reason"], "validation_failed")
+        self.assertEqual(gate.result["repairs"][0]["refusal"]["reason"], "validation_failed")
+        self.assertEqual(gate.read_requirements(self.remote_head()), ["discount", "fee"])
+
+    def test_unresolved_structural_conflict_falls_back_but_bad_binary_does_not(self):
+        self.accept_discount()
+        self.branch("feature/fee", self.start, {"money.py": FEE})
+        for reason in ("structural_unresolved", "structural_checksum_mismatch"):
+            gate = self.gate(reason, "feature/fee", "fee")
+            structural, model = Mock(), Mock()
+            structural.propose.side_effect = StructuralError(reason, "Injected structural result")
+            model.propose.return_value = self.proposal(COMBINED)
+            with patch.dict(os.environ, QUEUE_STRUCTURAL_REPAIR="true"), \
+                    patch("queue_gate.StructuralRepairClient.from_environment", return_value=structural), \
+                    patch("queue_gate.RouterRepairClient.from_environment", return_value=model):
+                if reason == "structural_unresolved":
+                    gate.prepare(gate.args)
+                    self.assertEqual(model.propose.call_count, 1)
+                else:
+                    with self.assertRaises(Rejected) as error:
+                        gate.prepare(gate.args)
+                    self.assertEqual(error.exception.reason, "structural_infrastructure_error")
+                    model.assert_not_called()
+
+    def test_github_request_cannot_publish_to_another_target(self):
+        gate = self.gate("wrong-target", "feature/source", "baseline")
+        with patch.dict(os.environ, GITHUB_ACTIONS="true", PR_NUMBER="7", EXPECTED_HEAD=self.source,
+                        DISPATCHER_RUN_ID="123", PR_EVENT_ACTION="synchronize"):
+            with self.assertRaises(Rejected) as error:
+                gate.prepare(gate.args)
+        self.assertEqual(error.exception.reason, "invalid_pr")
+
+    def test_durable_budget_reservation_precedes_post_and_blocks_new_run(self):
+        self.accept_discount()
+        self.branch("feature/fee", self.start, {"money.py": FEE})
+        gate = self.gate("durable-first", "feature/fee", "fee")
+        model = Mock()
+        def lost_response(context):
+            self.assertTrue(gate.result["repairs"][-1]["budget_reservation"]["ledger_commit"])
+            raise RepairError("repair_transport_error", "Lost response")
+        model.propose.side_effect = lost_response
+        reservations = [{"ordinal": i, "ledger_commit": str(i) * 40} for i in (1, 2)]
+        with patch.dict(os.environ, QUEUE_DURABLE_BUDGET="true"), \
+                patch("queue_gate.reserve_budget", side_effect=reservations) as ledger, \
+                patch("queue_gate.RouterRepairClient.from_environment", return_value=model):
+            with self.assertRaises(Rejected) as error:
+                gate.prepare(gate.args)
+        self.assertEqual(error.exception.reason, "repair_exhausted")
+        self.assertEqual(model.propose.call_count, 2)
+        self.assertEqual(ledger.call_count, 2)
+        repeated = self.gate("durable-new-run", "feature/fee", "fee")
+        with patch.dict(os.environ, QUEUE_DURABLE_BUDGET="true", GITHUB_RUN_ID="999"), \
+                patch("queue_gate.reserve_budget", side_effect=BudgetError("budget_exhausted", "Two slots used")), \
+                patch("queue_gate.RouterRepairClient.from_environment") as no_model:
+            with self.assertRaises(Rejected) as error:
+                repeated.prepare(repeated.args)
+        self.assertEqual(error.exception.reason, "repair_exhausted")
+        self.assertEqual(repeated.result["repairs"], [])
+        no_model.assert_not_called()
+
+    def test_source_push_after_prepare_stops_old_request_before_publication(self):
+        gate = self.gate("stale", "feature/source", "baseline")
+        gate.prepare(gate.args)
+        old = self.remote_head()
+        gate.state["pr_request"] = {"expected_head": self.source}
+        gate.save()
+        from queue_pr import PRError
+        with patch("queue_gate.guard_pr", side_effect=PRError("pr_superseded", "New push")), \
+                patch("queue_gate.RouterRepairClient.from_environment") as model:
+            with self.assertRaises(Rejected) as error:
+                gate.publish()
+        self.assertEqual(error.exception.reason, "pr_superseded")
+        self.assertEqual(self.remote_head(), old)
+        model.assert_not_called()
 
 
 if __name__ == "__main__":
