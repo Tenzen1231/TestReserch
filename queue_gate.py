@@ -21,10 +21,13 @@ import traceback
 import uuid
 
 from queue_status import CommitStatuses, StatusError
+from queue_repair import RouterRepairClient, RepairError, MODEL, strict_json
+from acceptance import CONTRACTS, REGISTRY_PATH, contract_cases
 
 
 ALLOWED = {"money.py", "receipt.py", "email_receipt.py", "feature_a.py", "feature_b.py", "feature_c.py"}
 MAX_ATTEMPTS = 3
+MAX_REPAIRS = 2
 VALIDATION_IMAGE = "python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2"
 INFRASTRUCTURE_ERRORS = {"internal_error", "git_error", "status_delivery_failed", "trusted_control_changed",
                          "publication_unconfirmed", "validation_infrastructure_error", "candidate_not_observed"}
@@ -43,6 +46,10 @@ REASONS_RU = {
     "git_error": "не удалось выполнить операцию Git",
     "trusted_control_changed": "код проверки изменился во время запуска",
     "interrupted": "запуск прерван до подтверждения результата",
+    "repair_exhausted": "две попытки ремонта не помогли; нужен человек",
+    "repair_rerun_blocked": "повтор запуска не возобновляет ремонт; нужен человек",
+    "invalid_requirements": "не удалось прочитать сохранённые требования",
+    "requirement_not_recorded": "для принятой версии не зарегистрировано это требование",
 }
 
 
@@ -54,21 +61,22 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def complete_validation_report(stdout, returncode):
+def complete_validation_report(stdout, returncode, requirements=()):
     """Fail closed if imported code exits before the fixed oracle finishes."""
-    expected = {module + ":" + str(amount): f"{amount:.2f}"
-                for module in ("receipt", "email_receipt") for amount in (0, 0.01, 12.34, 100)}
+    expected = {case[0]: case[-1] for case in contract_cases(requirements)}
     try:
         report = json.loads(stdout)
         checks = report["checks"]
         identifiers = [check["check"] for check in checks]
-        if (returncode != 0 or report.get("passed") is not True or len(checks) != 9
+        if (returncode != 0 or report.get("passed") is not True or len(checks) != len(expected) + 1
                 or set(identifiers) != set(expected) | {"three_way_interaction"}
                 or any(check.get("passed") is not True for check in checks)):
             return False, report
         for check in checks:
             if check["check"] in expected:
-                if check.get("expected") != expected[check["check"]] or check.get("actual") != expected[check["check"]]:
+                value = expected[check["check"]]
+                if (type(check.get("actual")) is not type(value)
+                        or check.get("expected") != value or check.get("actual") != value):
                     return False, report
             else:
                 flags = check.get("flags")
@@ -128,7 +136,7 @@ class Gate:
 
     def clean(self, value):
         value = str(value)
-        for secret in (self.token, self.auth):
+        for secret in (self.token, self.auth, os.environ.get("ROUTERAI_API_KEY")):
             if secret:
                 value = value.replace(secret, "[REDACTED]")
         return value
@@ -194,6 +202,8 @@ class Gate:
         description = label + ": " + REASONS_RU.get(reason, reason)
         self.result.update(decision="error" if infrastructure else "rejected", reason=reason,
                            decision_label=label, description=description)
+        if reason in ("repair_exhausted", "repair_rerun_blocked"):
+            self.result["needs_human"] = True
         if detail:
             self.result["detail"] = self.clean(detail)
         self.log(description)
@@ -234,6 +244,7 @@ class Gate:
         if (self.text("rev-parse", "HEAD") != self.state["trusted_head"]
                 or digest(self.oracle) != self.state["validator_sha256"]
                 or digest(__file__) != self.state["gate_sha256"]
+                or digest(Path(__file__).with_name("queue_repair.py")) != self.state["repair_module_sha256"]
                 or digest(Path(__file__).with_name("queue_status.py")) != self.state["status_module_sha256"]):
             raise Rejected("trusted_control_changed", "Trusted gate/oracle checkout changed during the run")
 
@@ -268,7 +279,8 @@ class Gate:
                    "--memory=256m", "--cpus=1", "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=16m",
                    "--mount", "type=bind,src=" + str(export) + ",dst=/candidate,readonly",
                    "--mount", "type=bind,src=" + str(self.oracle) + ",dst=/oracle/acceptance.py,readonly",
-                   "--workdir=/candidate", image, "python", "-I", "-B", "/oracle/acceptance.py", "/candidate"]
+                   "--workdir=/candidate", image, "python", "-I", "-B", "/oracle/acceptance.py", "/candidate",
+                   json.dumps(self.state.get("requirements", []))]
         return command, {"container": container, "image": image, "network": "none", "exported_commit": tested_commit}
 
     def run_validation(self, directory, tested_commit, scope):
@@ -279,12 +291,13 @@ class Gate:
         self.log("Validating " + scope + " commit " + tested_commit)
         command, sandbox = self.validation_command(tested_commit)
         try:
-            process = subprocess.run(command or [sys.executable, "-I", "-B", str(self.oracle), str(directory)],
+            process = subprocess.run(command or [sys.executable, "-I", "-B", str(self.oracle), str(directory),
+                                                  json.dumps(self.state.get("requirements", []))],
                                      cwd=self.repo, env=env, capture_output=True, text=True,
                                      encoding="utf-8", errors="replace", timeout=120)
             if sandbox and process.returncode in (125, 126, 127):
                 raise Rejected("validation_infrastructure_error", self.clean(process.stderr[-2000:]))
-            passed, report = complete_validation_report(process.stdout, process.returncode)
+            passed, report = complete_validation_report(process.stdout, process.returncode, self.state.get("requirements", []))
             validation = {"passed": passed, "returncode": process.returncode, "report": report,
                           "stdout": self.clean(process.stdout[-16000:]), "stderr": self.clean(process.stderr[-16000:]),
                           "tested_commit": tested_commit, "scope": scope, "validator_sha256": before_hash}
@@ -305,6 +318,122 @@ class Gate:
         self.trusted_unchanged()
         return validation
 
+    def read_requirements(self, commit):
+        value = self.git("show", commit + ":" + REGISTRY_PATH, check=False)
+        try:
+            if value.returncode or len(value.stdout) > 4096:
+                raise ValueError()
+            registry = strict_json(value.stdout)
+            accepted = registry["accepted"]
+            if (set(registry) != {"version", "accepted"} or type(registry["version"]) is not int
+                    or registry["version"] != 1 or not isinstance(accepted, list)
+                    or any(not isinstance(item, str) for item in accepted)
+                    or len(accepted) != len(set(accepted)) or set(accepted) - set(CONTRACTS)):
+                raise ValueError()
+            return sorted(accepted)
+        except (ValueError, TypeError, KeyError):
+            raise Rejected("invalid_requirements", "Missing or invalid requirement registry at " + commit) from None
+
+    def candidate_commit(self, directory, source, base, attempt):
+        if self.text("diff", "--name-only", "--diff-filter=U", cwd=directory):
+            raise Rejected("merge_conflict", "Unresolved file conflicts remain")
+        registry = directory / REGISTRY_PATH
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(json.dumps({"version": 1, "accepted": self.state["requirements"]},
+                                       sort_keys=True) + "\n", encoding="utf-8")
+        self.git("add", "--", REGISTRY_PATH, cwd=directory)
+        changed = self.text("diff", "--cached", "--name-only", cwd=directory)
+        merge_head = self.git("rev-parse", "--verify", "MERGE_HEAD", cwd=directory, check=False)
+        if changed or merge_head.returncode == 0:
+            self.git("commit", "-m", "feat: согласованы изменения и сохранённые требования", cwd=directory)
+        candidate = self.text("rev-parse", "HEAD", cwd=directory)
+        tree = self.text("rev-parse", "HEAD^{tree}", cwd=directory)
+        if not self.ancestor(base, candidate) or not self.ancestor(source, candidate):
+            raise Rejected("non_forward_candidate", "Candidate must preserve both source and target history")
+        paths = self.paths(base, candidate)
+        if set(paths) - ALLOWED - {REGISTRY_PATH}:
+            raise Rejected("scope_violation", "Candidate changes trusted control files")
+        if self.read_requirements(candidate) != self.state["requirements"]:
+            raise Rejected("invalid_requirements", "Candidate lost accepted requirements")
+        self.ordinary_files(candidate)
+        attempt.update(candidate=candidate, tree=tree, candidate_changed_paths=paths)
+        self.result.update(candidate=candidate, tree=tree)
+        validation = self.run_validation(directory, candidate, "merged_candidate")
+        attempt.update(validation=validation, finished_at=now(), decision="prepared" if validation["passed"] else "rejected")
+        self.result["validation"] = validation
+        self.save()
+        if not validation["passed"]:
+            raise Rejected("validation_failed", "Trusted acceptance checks rejected the tested snapshot")
+        return candidate, tree
+
+    def repair_context(self, directory, common, source, base, refusal):
+        def snapshot(commit):
+            files = {}
+            for name in sorted(ALLOWED):
+                result = self.git("show", commit + ":" + name, check=False)
+                if result.returncode == 0:
+                    files[name] = result.stdout
+            return files
+        return {
+            "allowed_paths": sorted(ALLOWED),
+            "requirements": {key: CONTRACTS[key] for key in self.state["requirements"]},
+            "baseline_requirement": "receipt.format_total and email_receipt.format_email_total return original ruble amounts with two decimals. Preserve unrelated enabled feature flags; all three flags simultaneously enabled are incompatible.",
+            "new_requirement": self.state["requirement"],
+            "refusal": refusal,
+            "base_sha": base, "source_sha": source,
+            "common_ancestor": snapshot(common), "current_target": snapshot(base), "submission": snapshot(source),
+            "current_candidate": {name: (directory / name).read_text(encoding="utf-8")
+                                  for name in sorted(ALLOWED) if (directory / name).is_file()},
+            "previous_repairs": [{"reason": item.get("reason"), "explanation": item.get("explanation")}
+                                 for item in self.result.get("repairs", [])],
+        }
+
+    def repair_candidate(self, directory, common, source, base, attempt, error):
+        if not self.state["auto_repair"]:
+            raise error
+        if int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")) > 1:
+            raise Rejected("repair_rerun_blocked", "A job rerun cannot reset the automatic repair budget")
+        refusal = {"reason": error.reason, "validation": self.result.get("validation")}
+        while self.state["repair_calls_reserved"] < MAX_REPAIRS:
+            # Reserve durably BEFORE constructing the HTTP client or making a
+            # request. Unknown outcomes and invalid responses consume budget.
+            self.state["repair_calls_reserved"] += 1
+            record = {"number": self.state["repair_calls_reserved"], "started_at": now(),
+                      "source": source, "base": base, "refusal": refusal, "state": "reserved"}
+            self.result.setdefault("repairs", []).append(record)
+            self.save()
+            self.status(source, "pending", "Исправляем автоматически: попытка " + str(record["number"]) + "/2")
+            try:
+                client = RouterRepairClient.from_environment(allowed_paths=ALLOWED)
+                proposal = client.propose(self.repair_context(directory, common, source, base, refusal))
+                record.update(metadata=proposal["metadata"], explanation=proposal["explanation"],
+                              patch_sha256=hashlib.sha256(json.dumps(proposal["files"], sort_keys=True).encode()).hexdigest(),
+                              changed_paths=sorted(proposal["files"]), state="proposed")
+                self.save()
+                self.trusted_unchanged()
+                for name, content in proposal["files"].items():
+                    if name not in ALLOWED or (directory / name).is_symlink():
+                        raise Rejected("scope_violation", "Repair attempted to change a protected path")
+                    (directory / name).write_text(content, encoding="utf-8")
+                self.git("add", "--", *sorted(proposal["files"]), cwd=directory)
+                candidate, tree = self.candidate_commit(directory, source, base, attempt)
+                record.update(state="validated", candidate=candidate, tree=tree,
+                              validation=self.result["validation"], finished_at=now())
+                self.save()
+                return candidate, tree
+            except RepairError as failure:
+                record.update(state="failed", reason=failure.reason, metadata=failure.metadata,
+                              detail=self.clean(failure.detail), finished_at=now())
+                refusal = {"reason": failure.reason, "detail": failure.detail}
+            except Rejected as failure:
+                if failure.reason not in ("validation_failed", "merge_conflict"):
+                    raise
+                record.update(state="failed", reason=failure.reason, candidate=self.result.get("candidate"),
+                              validation=self.result.get("validation"), finished_at=now())
+                refusal = {"reason": failure.reason, "validation": self.result.get("validation")}
+            self.save()
+        raise Rejected("repair_exhausted", "No safe repair after two reserved API attempts; preserve the branches for a human")
+
     def build(self, observation, trigger):
         source, base = observation["source"], observation["base"]
         self.select_source(source)
@@ -313,8 +442,14 @@ class Gate:
                    "base": base, "candidate": None, "tree": None, "validator_sha256": self.state["validator_sha256"]}
         self.result["attempts"].append(attempt)
         self.result.update(source=source, base=base, candidate=None, tree=None, validation=None)
+        accepted = self.read_requirements(base)
+        incoming = self.state["requirement"]
+        self.state["requirements"] = sorted(set(accepted) | ({incoming} if incoming != "baseline" else set()))
+        attempt.update(accepted_requirements=accepted, required_contracts=self.state["requirements"])
         self.save()
         if self.ancestor(source, base):
+            if incoming != "baseline" and incoming not in accepted:
+                raise Rejected("requirement_not_recorded", "Integrated source was not accepted under this requirement")
             attempt["decision"] = "already_integrated"
             self.result.update(decision="already_integrated", reason="source_is_already_in_target",
                                observed_remote_head=base, observed_source_head=source,
@@ -330,27 +465,25 @@ class Gate:
             raise Rejected("scope_violation", "Submission changes protected or undeclared files: "
                            + ", ".join(sorted(set(changed) - ALLOWED)))
         self.ordinary_files(source)
+        self.ordinary_files(base)
         directory = self.directory / ("candidate-" + str(number))
         self.git("worktree", "add", "--quiet", "--detach", str(directory), base)
-        merge = self.git("merge", "--no-ff", "--no-edit", "-m", "test: объединено проверенное изменение", source,
+        merge = self.git("merge", "--no-ff", "--no-commit", source,
                          cwd=directory, check=False)
-        if merge.returncode:
-            attempt.update(decision="rejected", reason="merge_conflict", merge_output=self.clean(merge.stdout + merge.stderr))
-            raise Rejected("merge_conflict", "Cannot construct a clean candidate from current source and target")
-        candidate = self.text("rev-parse", "HEAD", cwd=directory)
-        tree = self.text("rev-parse", "HEAD^{tree}", cwd=directory)
-        attempt.update(candidate=candidate, tree=tree)
-        self.result.update(candidate=candidate, tree=tree)
-        candidate_changed = self.paths(base, candidate)
-        attempt["candidate_changed_paths"] = candidate_changed
-        if set(candidate_changed) - ALLOWED:
-            raise Rejected("scope_violation", "Merged candidate changes the control mechanism")
-        self.ordinary_files(candidate)
-        validation = self.run_validation(directory, candidate, "merged_candidate")
-        attempt.update(validation=validation, finished_at=now(), decision="prepared" if validation["passed"] else "rejected")
-        self.result["validation"] = validation
-        if not validation["passed"]:
-            raise Rejected("validation_failed", "Trusted acceptance checks rejected the tested snapshot")
+        try:
+            if merge.returncode:
+                conflicts = set(self.text("diff", "--name-only", "--diff-filter=U", cwd=directory).splitlines())
+                if not conflicts or conflicts - ALLOWED:
+                    raise Rejected("git_error", "Merge failed outside repairable product paths")
+                attempt["merge_output"] = self.clean(merge.stdout + merge.stderr)
+                raise Rejected("merge_conflict", "Cannot construct a clean candidate from current source and target")
+            candidate, tree = self.candidate_commit(directory, source, base, attempt)
+        except Rejected as error:
+            if error.reason not in ("merge_conflict", "validation_failed"):
+                raise
+            attempt["initial_rejection"] = error.reason
+            self.save()
+            candidate, tree = self.repair_candidate(directory, common, source, base, attempt, error)
         self.state["prepared"] = {"source": source, "base": base, "candidate": candidate,
                                   "tree": tree, "attempt": number, "directory": str(directory)}
         self.result.update(decision="prepared", reason="checks_passed", decision_label="Ожидает публикации")
@@ -359,15 +492,27 @@ class Gate:
         return True
 
     def prepare(self, args):
+        if self.state_path.exists():
+            self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.result = json.loads(self.result_path.read_text(encoding="utf-8"))
+            raise Rejected("invalid_input", "Prepare cannot reset an existing request state")
         seconds = self.validate_inputs(args.base_branch, args.source_branch, args.hold_seconds)
+        if args.requirement not in {"baseline", *CONTRACTS}:
+            raise Rejected("invalid_input", "Unknown trusted requirement")
         self.state.update(base_branch=args.base_branch, source_branch=args.source_branch,
+                          requirement=args.requirement, auto_repair=os.environ.get("QUEUE_AUTO_REPAIR") == "true",
+                          repair_calls_reserved=0,
                           hold_seconds=seconds, repo=str(self.repo), trusted_head=self.text("rev-parse", "HEAD"),
                           validator_sha256=digest(self.oracle), gate_sha256=digest(__file__),
+                          repair_module_sha256=digest(Path(__file__).with_name("queue_repair.py")),
                           status_module_sha256=digest(Path(__file__).with_name("queue_status.py")))
         self.result.update(base_branch=args.base_branch, source_branch=args.source_branch,
                            validator_sha256=self.state["validator_sha256"],
                            gate_sha256=self.state["gate_sha256"], trusted_head=self.state["trusted_head"],
                            max_attempts=MAX_ATTEMPTS)
+        self.result.update(max_repair_calls=MAX_REPAIRS, repair_model=MODEL, repairs=[],
+                           requirement=args.requirement, auto_repair=self.state["auto_repair"],
+                           repair_budget_scope="one workflow run; job reruns cannot call the repair API")
         self.save()
         self.build(self.observe("prepare"), "initial_prepare")
 
@@ -473,6 +618,7 @@ def main():
     parser.add_argument("--base-branch", default="")
     parser.add_argument("--source-branch", default="")
     parser.add_argument("--hold-seconds", default="0")
+    parser.add_argument("--requirement", default="baseline")
     args = parser.parse_args()
     gate = Gate(args.repo, args.state_dir)
     exit_code = 0

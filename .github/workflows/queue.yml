@@ -13,6 +13,17 @@ on:
         description: 'Ветка участника (feature/*)'
         required: true
         type: string
+      requirement:
+        description: 'Требование новой правки (принятые требования сохраняются автоматически)'
+        required: true
+        type: choice
+        default: baseline
+        options:
+          - baseline
+          - discount
+          - fee
+          - currency
+          - legacy-rubles
       hold_seconds:
         description: 'Pause before publication for controlled concurrency tests (0..90)'
         required: true
@@ -38,6 +49,8 @@ jobs:
       BASE_BRANCH: ${{ inputs.base_branch }}
       SOURCE_BRANCH: ${{ inputs.source_branch }}
       HOLD_SECONDS: ${{ inputs.hold_seconds }}
+      REQUIREMENT: ${{ inputs.requirement }}
+      QUEUE_AUTO_REPAIR: 'true'
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out trusted gate and oracle
@@ -57,11 +70,13 @@ jobs:
         id: prepare
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          ROUTERAI_API_KEY: ${{ secrets.ROUTERAI_API_KEY }}
         run: >-
           python queue_gate.py prepare
           --repo "$GITHUB_WORKSPACE" --state-dir "$STATE_DIR"
           --base-branch "$BASE_BRANCH" --source-branch "$SOURCE_BRANCH"
           --hold-seconds "$HOLD_SECONDS"
+          --requirement "$REQUIREMENT"
 
       - name: Hold for concurrent changes
         if: steps.prepare.outputs.ready == 'true'
@@ -78,6 +93,7 @@ jobs:
         if: steps.prepare.outputs.ready == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          ROUTERAI_API_KEY: ${{ secrets.ROUTERAI_API_KEY }}
           QUEUE_DEPLOY_KEY: ${{ secrets.QUEUE_DEPLOY_KEY }}
           QUEUE_SSH_PUBLISH: 'true'
         run: |
@@ -124,6 +140,10 @@ jobs:
                   if key in result:
                       stream.write(f'- {key}: `{result[key]}`\n')
               stream.write(f"- Попыток проверки: {len(result['attempts'])}\n")
+              stream.write(f"- Попыток ремонта ИИ: {len(result.get('repairs', []))}/2\n")
+              if result.get('needs_human'):
+                  stream.write('\n**Нужен человек:** согласуйте спорное поведение и одного автора итоговой правки. '
+                               'Автоматических повторов больше не будет.\n')
               stream.write('\nСтатус участника относится к указанному source SHA и целевой ветке. '
                            'Отклонение или ошибка делают запуск красным; доказательства сохраняются всегда. '
                            'Информационный статус не заменяет серверные ограничения публикации.\n')
