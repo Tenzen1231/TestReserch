@@ -1,0 +1,30 @@
+name: Individual branch checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  individual:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Check the individual source commit
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          git -C candidate rev-parse HEAD
+          python3 harness/acceptance.py candidate
