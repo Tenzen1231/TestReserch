@@ -30,9 +30,12 @@ _BASE_PARAMETERS = {"stream": False, "temperature": 0, "response_format": {"type
 # DeepSeek reasons at high effort by default and the hidden reasoning shares
 # max_tokens with the answer. Attempt 1 limits it; attempt 2 must not repeat a
 # failed attempt 1, so it disables reasoning. The ledger ordinal selects one.
+# The cheapest default route serves fp4-quantized weights; prefer full-precision/fp8
+# providers and keep fallbacks so an outage does not burn the attempt.
+_ROUTE = {"provider": {"order": ["byteplus", "deepinfra"], "allow_fallbacks": True}}
 REPAIR_PROFILES = (
-    ({**_BASE_PARAMETERS, "max_tokens": 16384, "reasoning": {"effort": "low"}}, 180),
-    ({**_BASE_PARAMETERS, "max_tokens": 8192, "reasoning": {"enabled": False}}, 90),
+    ({**_BASE_PARAMETERS, **_ROUTE, "max_tokens": 16384, "reasoning": {"effort": "low"}}, 180),
+    ({**_BASE_PARAMETERS, **_ROUTE, "max_tokens": 16384, "reasoning": {"enabled": False}}, 180),
 )
 
 SYSTEM_PROMPT = """Repair the supplied public training code after an integration-queue rejection.
@@ -134,6 +137,8 @@ def response_shape(choice, message):
 
 
 class RouterRepairClient:
+    system_prompt = SYSTEM_PROMPT
+
     def __init__(self, api_key, allowed_paths=None, timeout=None, profile=1):
         if not isinstance(api_key, str) or not re.fullmatch(r"[\x21-\x7e]{1,4096}", api_key):
             raise RepairError("repair_missing_credentials", "A valid ROUTERAI_API_KEY is required")
@@ -178,7 +183,7 @@ class RouterRepairClient:
         if context_size > MAX_CONTEXT_BYTES:
             raise RepairError("repair_context_too_large", "Repair context exceeds its size limit")
         self.reject_credential(public_context)
-        body = {"model": MODEL, "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+        body = {"model": MODEL, "messages": [{"role": "system", "content": self.system_prompt},
                                                {"role": "user", "content": public_context}],
                 **self.parameters}
         encoded = json.dumps(body, ensure_ascii=False, allow_nan=False,

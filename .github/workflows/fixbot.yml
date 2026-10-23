@@ -1,0 +1,126 @@
+name: Итоговый агент
+run-name: 'PR #${{ inputs.pr_number }} — ${{ inputs.head_ref }} — ${{ inputs.expected_head }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Номер PR в feature/lab-main'
+        required: true
+        type: string
+      head_ref:
+        description: 'Ветка PR'
+        required: true
+        type: string
+      expected_head:
+        description: 'Точная версия PR'
+        required: true
+        type: string
+      reason:
+        description: 'Почему запущен (событие PR, движение общей ветки, подметальщик)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: fixbot-feature-lab-main
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: queue-publisher
+    timeout-minutes: 30
+    env:
+      FIXBOT_TARGET: feature/lab-main
+      FIXBOT_SSH_PUBLISH: 'true'
+      PR_NUMBER: ${{ inputs.pr_number }}
+      EXPECTED_HEAD: ${{ inputs.expected_head }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out the trusted agent
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare isolated test image
+        run: |
+          for attempt in 1 2 3; do
+            docker pull python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2 && exit 0
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Install verified Mergiraf 0.20.0
+        run: |
+          mkdir -p "$RUNNER_TEMP/mergiraf"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 4 --retry-all-errors --retry-delay 5 \
+            https://codeberg.org/mergiraf/mergiraf/releases/download/v0.20.0/mergiraf_x86_64-unknown-linux-musl.tar.gz \
+            --output "$RUNNER_TEMP/mergiraf/archive.tar.gz"
+          printf '%s  %s\n' fc77469be936b02ab9021b984a3aebc9250a21ae3d264f2ef2198eb8b31b2a7b "$RUNNER_TEMP/mergiraf/archive.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/mergiraf/archive.tar.gz" -C "$RUNNER_TEMP/mergiraf"
+          binary=$(find "$RUNNER_TEMP/mergiraf" -type f -name mergiraf)
+          printf '%s  %s\n' 47b64ee837b110acd48a633c0bd13ff09e6a794b9739f896362464e64f7c7217 "$binary" | sha256sum --check --strict
+          echo "MERGIRAF_BINARY=$binary" >> "$GITHUB_ENV"
+
+      - name: Load publisher key
+        env:
+          QUEUE_DEPLOY_KEY: ${{ secrets.QUEUE_DEPLOY_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, time, urllib.request
+          from queue_status import NoRedirect
+          request = urllib.request.Request('https://api.github.com/meta', headers={
+              'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN'],
+              'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+          for attempt in range(3):
+              try:
+                  with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+                      keys = json.load(response)['ssh_keys']
+                  break
+              except (OSError, ValueError, KeyError):
+                  if attempt == 2:
+                      raise
+                  time.sleep(10 * (attempt + 1))
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'github_known_hosts').write_text(
+              ''.join('github.com ' + key + '\n' for key in keys), encoding='utf-8')
+          PY
+          eval "$(ssh-agent -s)" >/dev/null
+          printf '%s\n' "$QUEUE_DEPLOY_KEY" | ssh-add - >/dev/null
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          echo "GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/github_known_hosts" >> "$GITHUB_ENV"
+
+      - name: Merge the shared branch into the PR, repair, test, publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ROUTERAI_API_KEY: ${{ secrets.ROUTERAI_API_KEY }}
+        run: >-
+          python fixbot.py fix --repo "$GITHUB_WORKSPACE" --state-dir "$RUNNER_TEMP/fixbot"
+          --pr "$PR_NUMBER" --expected-head "$EXPECTED_HEAD"
+
+      - name: Close publisher identity
+        if: always()
+        run: |
+          if [ -n "${SSH_AGENT_PID:-}" ]; then ssh-agent -k >/dev/null; fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fixbot-evidence
+          path: ${{ runner.temp }}/fixbot/result.json
+          if-no-files-found: warn
+          retention-days: 30
