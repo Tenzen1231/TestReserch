@@ -10,4 +10,4 @@ class ReceiptTests(unittest.TestCase):
 
     def test_receipt_lists_lines_and_total(self):
         text = format_receipt([Item("a", "Чай", 15000, 2)])
-        self.assertEqual(text, "Чай × 2: 300,00 ₽\nИтого: 300,00 ₽")
+        self.assertEqual(text, "Чай × 2: 300,00 ₽\nИтого: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")

@@ -35,15 +35,15 @@ class DeliveryPricingTests(unittest.TestCase):
 class DeliveryReceiptTests(unittest.TestCase):
     def test_pickup_receipt_unchanged(self):
         text = format_receipt([Item("a", "Чай", 15000, 2)], delivery="pickup")
-        self.assertEqual(text, "Чай × 2: 300,00 ₽\nИтого: 300,00 ₽")
+        self.assertEqual(text, "Чай × 2: 300,00 ₽\nИтого: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
 
     def test_courier_receipt_shows_fee_before_total(self):
         text = format_receipt([Item("a", "Чай", 15000, 2)], delivery="courier")
-        self.assertEqual(text, "Чай × 2: 300,00 ₽\nДоставка: 300,00 ₽\nИтого: 600,00 ₽")
+        self.assertEqual(text, "Чай × 2: 300,00 ₽\nДоставка: 300,00 ₽\nИтого: 600,00 ₽\nв т.ч. НДС 20 %: 100,00 ₽")
 
     def test_courier_receipt_free_delivery(self):
         text = format_receipt([Item("a", "Набор", 300000)], delivery="courier")
-        self.assertEqual(text, "Набор × 1: 3 000,00 ₽\nДоставка: 0,00 ₽\nИтого: 3 000,00 ₽")
+        self.assertEqual(text, "Набор × 1: 3 000,00 ₽\nДоставка: 0,00 ₽\nИтого: 3 000,00 ₽\nв т.ч. НДС 20 %: 500,00 ₽")
 
     def test_receipt_unknown_delivery_is_rejected(self):
         with self.assertRaises(ValueError):
