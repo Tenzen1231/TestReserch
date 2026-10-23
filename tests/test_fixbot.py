@@ -324,6 +324,40 @@ class FixbotTests(unittest.TestCase):
             bot.fix(7, fixed)
         self.assertEqual((bot.result["decision"], self.head(TARGET)), ("merged", fixed))
 
+    def test_both_sides_editing_one_expected_text_combine_without_the_model(self):
+        start = self.head(TARGET)
+        receipt = (SEED / "shop" / "receipt.py").read_text(encoding="utf-8")
+        tests = (SEED / "tests" / "test_receipt.py").read_text(encoding="utf-8")
+        sku_line = 'lines = [f"{item.title} ({item.sku}) × {item.qty}: {format_money(line_total(item))}" for item in items]'
+        old_line = 'lines = [f"{item.title} × {item.qty}: {format_money(line_total(item))}" for item in items]'
+        vat_tail = ('    lines.append("Итого: " + format_money(calculate_total(items, customer)))\n'
+                    '    lines.append("в т.ч. НДС 20 %: " + format_money(calculate_total(items, customer) * 20 // 120))\n')
+        old_tail = '    lines.append("Итого: " + format_money(calculate_total(items, customer)))\n'
+        self.branch("feature/a", start, {"shop/receipt.py": receipt.replace(old_line, sku_line),
+                                         "tests/test_receipt.py": tests.replace("Чай × 2", "Чай (a) × 2")})
+        self.merge_into_target("feature/a")
+        sha = self.branch("feature/b", start, {
+            "shop/receipt.py": receipt.replace(old_tail, vat_tail),
+            "tests/test_receipt.py": tests.replace('Итого: 300,00 ₽")', 'Итого: 300,00 ₽\\nв т.ч. НДС 20 %: 50,00 ₽")')})
+        both = receipt.replace(old_line, sku_line).replace(old_tail, vat_tail)
+        with patch.dict(os.environ, {"MERGIRAF_BINARY": ""}):  # Plain git: both files conflict.
+            result, api, model = self.run_bot("feature/b", sha, ScriptedModel([{"shop/receipt.py": both}] * 2))
+        self.assertEqual(result["decision"], "merged", result.get("detail"))
+        self.assertEqual(result["tests_combined"], ["tests/test_receipt.py"])
+        self.assertTrue(all("tests/test_receipt.py" not in c["allowed_paths"] for c in model.contexts))
+        self.git(self.seed, "fetch", "-q", "origin")
+        merged = self.git(self.seed, "show", "origin/" + TARGET + ":tests/test_receipt.py")
+        self.assertIn('"Чай (a) × 2: 300,00 ₽\\nИтого: 300,00 ₽\\nв т.ч. НДС 20 %: 50,00 ₽"', merged)
+
+    def test_merge3_keeps_independent_edits_and_refuses_touching_ones(self):
+        base = 'x = "Чай × 2\\nИтого"\n'
+        self.assertEqual(fixbot.merge3(base, base.replace("Чай", "Чай (a)"), base.replace("Итого", "Итого\\nНДС")),
+                         'x = "Чай (a) × 2\\nИтого\\nНДС"\n')
+        self.assertIsNone(fixbot.merge3(base, base.replace("Чай", "Кофе"), base.replace("Чай", "Сок")))
+        self.assertIsNone(fixbot.merge3("ab", "aXb", "aYb"))  # Same insertion point: order is a human decision.
+        self.assertEqual(fixbot.merge3(base, base.replace("Чай", "Кофе"), base.replace("Чай", "Кофе")),
+                         base.replace("Чай", "Кофе"))
+
     def test_moved_positional_parameters_are_detected(self):
         side = "def total(items, customer=None, delivery='pickup'):\n    return 1\n"
         merged = "def total(items, customer=None, promo_code=None, delivery='pickup'):\n    return 1\n"

@@ -13,7 +13,7 @@ Usage:
 import argparse
 import ast
 from datetime import datetime, timezone
-import hashlib
+import difflib
 import io
 import json
 import os
@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import textwrap
 import uuid
 
 from queue_budget import BudgetError, reserve as reserve_budget
@@ -81,8 +82,30 @@ def is_product(path):
     return path.startswith(PRODUCT_PREFIXES) and path.endswith(".py")
 
 
-def test_functions(text):
-    """Qualified test functions of one file -> normalized AST, independent of position."""
+def merge3(base, left, right):
+    """Character-level three-way merge of independent edits; None when edits touch or overlap.
+
+    Two developers often change the same expected text in different places (one adds a
+    line, the other renames an item). Each side's edits are kept verbatim; anything
+    adjacent or overlapping is left to a human.
+    """
+    def edits(new):
+        matcher = difflib.SequenceMatcher(None, base, new, autojunk=False)
+        return [(i1, i2, new[j1:j2]) for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal"]
+    merged = []
+    for start, end, text in sorted(set(edits(left)) | set(edits(right))):
+        if merged and start <= merged[-1][1]:
+            return None
+        merged.append((start, end, text))
+    result, position = [], 0
+    for start, end, text in merged:
+        result += [base[position:start], text]
+        position = end
+    return "".join(result) + base[position:]
+
+
+def test_functions(text, sources=False):
+    """Qualified test functions of one file -> normalized AST (or padded source)."""
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -94,9 +117,17 @@ def test_functions(text):
             if isinstance(node, ast.ClassDef):
                 visit(node.body, prefix + node.name + ".")
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-                found[prefix + node.name] = ast.dump(node, include_attributes=False)
+                found[prefix + node.name] = (ast.get_source_segment(text, node, padded=True) if sources
+                                             else ast.dump(node, include_attributes=False))
     visit(tree.body, "")
     return found
+
+
+def function_dump(source):
+    try:
+        return ast.dump(ast.parse(textwrap.dedent(source)).body[0], include_attributes=False)
+    except (SyntaxError, IndexError):
+        return None
 
 
 def preserved_tests(base, target, source, candidate):
@@ -106,10 +137,15 @@ def preserved_tests(base, target, source, candidate):
              (("base", base), ("target", target), ("source", source), ("candidate", candidate))}
     if any(value is None for value in sides.values()):
         return ["test file does not parse"]
+    texts = {name: test_functions(text, sources=True) if text is not None else {} for name, text in
+             (("base", base), ("target", target), ("source", source))}
     for name in sorted(set(sides["target"]) | set(sides["source"])):
         old, left, right = sides["base"].get(name), sides["target"].get(name), sides["source"].get(name)
         if left is not None and right is not None and left != right and old not in (left, right):
-            problems.append(name + ": both sides changed this test differently")
+            # Both changed it: only independent edits may combine, each kept verbatim.
+            combined = None if old is None else merge3(texts["base"][name], texts["target"][name], texts["source"][name])
+            if combined is None or function_dump(combined) != sides["candidate"].get(name):
+                problems.append(name + ": both sides changed this test and the edits cannot be combined verbatim")
             continue
         if left is None or right is None:
             # Deleting another side's test is a decision for a human, never for the bot.
@@ -412,6 +448,14 @@ class Bot:
                          "-m", "merge: совмещено с " + TARGET + " итоговым агентом", target,
                          cwd=worktree, check=False, secrets=False)
         conflicts = sorted(self.text("diff", "--name-only", "--diff-filter=U", cwd=worktree).splitlines())
+        for path in [p for p in conflicts if is_test(p)]:
+            # Tests are never written by the model: independent edits of both sides combine verbatim.
+            combined = merge3(self.show(base, path) or "", self.show(target, path) or "", self.show(head, path) or "")
+            if combined is not None and test_functions(combined) is not None:
+                (worktree / path).write_text(combined, encoding="utf-8", newline="")
+                self.git("add", "--", path, cwd=worktree)
+                conflicts.remove(path)
+                self.result.setdefault("tests_combined", []).append(path)
         self.step("merge", returncode=merge.returncode, conflicts=conflicts,
                   mergiraf=self.result.get("mergiraf") != "not_configured")
         bad = [p for p in conflicts if not (is_product(p) or is_test(p))]
