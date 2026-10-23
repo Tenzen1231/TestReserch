@@ -617,9 +617,14 @@ class Bot:
         try:
             pulls = paged(self.api, "/repos/" + self.api.repository + "/pulls?state=open&base=" + TARGET)
             for pr in pulls:
-                if pr["number"] != merged and not pr.get("draft"):
-                    dispatch(self.api, pr, "shared_branch_moved")
-                    self.result.setdefault("requeued", []).append(pr["number"])
+                if pr["number"] == merged or pr.get("draft"):
+                    continue
+                # A version already handed to a human stays with the human until its author pushes.
+                status = self.api.latest(pr["head"]["sha"], CommitStatuses.context(TARGET))
+                if status is not None and status.get("state") == "failure":
+                    continue
+                dispatch(self.api, pr, "shared_branch_moved")
+                self.result.setdefault("requeued", []).append(pr["number"])
         except StatusError as error:
             self.result["status_errors"].append("requeue: " + str(error))
         self.save()

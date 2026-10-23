@@ -57,6 +57,10 @@ class FakeGitHub:
         self.statuses.append((sha, state, description))
         return {}
 
+    def latest(self, sha, context):
+        found = [{"state": state, "description": text} for s, state, text in self.statuses if s == sha]
+        return found[-1] if found else None
+
 
 class ScriptedModel:
     system_prompt = ""
@@ -357,6 +361,20 @@ class FixbotTests(unittest.TestCase):
         self.assertIsNone(fixbot.merge3("ab", "aXb", "aYb"))  # Same insertion point: order is a human decision.
         self.assertEqual(fixbot.merge3(base, base.replace("Чай", "Кофе"), base.replace("Чай", "Кофе")),
                          base.replace("Чай", "Кофе"))
+
+    def test_after_a_merge_other_prs_are_requeued_except_those_handed_to_a_human(self):
+        start = self.head(TARGET)
+        sha = self.branch("feature/b", start, {"shop/gift.py": "X = 1\n"})
+        waiting = {"number": 8, "draft": False, "head": {"ref": "feature/c", "sha": "c" * 40}}
+        human = {"number": 9, "draft": False, "head": {"ref": "feature/d", "sha": "d" * 40}}
+        api = FakeGitHub({"number": 7, "state": "open", "draft": False, "title": "PR", "body": "",
+                          "head": {"ref": "feature/b", "sha": sha, "repo": {"full_name": FakeGitHub.repository}},
+                          "base": {"ref": TARGET, "repo": {"full_name": FakeGitHub.repository}}})
+        api.open = [api.pr, waiting, human]
+        api.statuses.append(("d" * 40, "failure", "Нужен человек: unresolved_conflict"))
+        bot = Bot(self.bot_repo, self.root / "requeue", api=api, client_factory=lambda p, o: ScriptedModel([]))
+        bot.fix(7, sha)
+        self.assertEqual([item["pr_number"] for item in api.dispatches], ["8"])
 
     def test_moved_positional_parameters_are_detected(self):
         side = "def total(items, customer=None, delivery='pickup'):\n    return 1\n"
