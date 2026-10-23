@@ -353,10 +353,15 @@ class Bot:
     def review(self, target, head, candidate):
         """What the merge changed in each author's own lines and APIs, for the PR comment."""
         base = self.result.get("base") or self.text("merge-base", target, head)
-        report = {"altered": {}, "moved_parameters": {}, "required": False}
+        report = {"altered": {}, "moved_parameters": {}, "edited_existing_tests": self.edited_tests(base, head),
+                  "required": False}
+        # Rewriting a test that already existed changes someone's requirement: its owner confirms.
+        if report["edited_existing_tests"] and os.environ.get("FIXBOT_EXISTING_TEST_EDITS", "review") == "review":
+            report["required"] = True
         sensitive = [prefix for prefix in os.environ.get("FIXBOT_REVIEW_PATHS", "").split(",") if prefix]
         if candidate == head:  # Nothing was merged or rewritten by the agent.
             self.result["review"] = report
+            self.save()
             return report
         for side_name, side in (("shared", target), ("pull_request", head)):
             for path in sorted(p for p in set(self.changed(base, side)) if is_product(p)):
@@ -371,6 +376,17 @@ class Bot:
         self.result["review"] = report
         self.save()
         return report
+
+    def edited_tests(self, base, head):
+        """Test functions that existed at the merge base and the PR changed or removed."""
+        edits = {}
+        for path in sorted(p for p in self.changed(base, head) if is_test(p)):
+            before = test_functions(self.show(base, path) or "") or {}
+            after = test_functions(self.show(head, path) or "") or {}
+            names = sorted(name for name in before if after.get(name) != before[name])
+            if names:
+                edits[path] = names
+        return edits
 
     def fetch(self, head_ref):
         prefix = "refs/fixbot/" + uuid.uuid4().hex
@@ -585,9 +601,10 @@ class Bot:
                  "both": sorted(t for t in failed if t in head_ids and t in target_ids),
                  "new_in_merge": sorted(t for t in failed if t not in head_ids and t not in target_ids)}
         self.result["escalation"] = {"failure": failure, "failed_by_side": sides}
-        contradiction = bool(sides["shared"] and sides["pull_request"]) or (
-            self.result.get("model_reported_contradiction", False) and bool(sides["shared"] or sides["pull_request"]))
+        # Proven only when attempts failed each side's tests in turn; a model's own verdict is an opinion.
+        contradiction = bool(sides["shared"] and sides["pull_request"])
         reason = ("conflicting_requirements" if contradiction else
+                  "model_sees_contradiction" if self.result.get("model_reported_contradiction") else
                   "unresolved_conflict" if failure.get("conflicts") else "tests_not_satisfied")
         return Stop("rejected", reason, json.dumps(sides, ensure_ascii=False), needs_human=True)
 
@@ -601,7 +618,13 @@ class Bot:
         for item in repairs:
             lines.append("  - " + str(item.get("ordinal")) + ": " + str(item.get("state")) + " — "
                          + str(item.get("explanation") or item.get("reason") or ""))
+        if self.result.get("tests_combined"):
+            lines.append("- Тесты слиты посимвольно без модели (правки обеих сторон дословно): "
+                         + ", ".join("`" + p + "`" for p in self.result["tests_combined"]))
         review = self.result.get("review") or {}
+        for path, names in (review.get("edited_existing_tests") or {}).items():
+            lines.append("- **Этот PR изменил существующие тесты** `" + path + "`: " + ", ".join(names[:10])
+                         + " — нужно подтверждение владельца (метка fixbot-approved)")
         if review.get("altered") or review.get("moved_parameters"):
             lines += ["", "**Проверьте решения модели** — строки авторов, которые не сохранились дословно:"]
             for side, title in (("shared", "общая ветка"), ("pull_request", "этот PR")):
@@ -650,6 +673,9 @@ class Bot:
                                        ("both", "Падают общие тесты"), ("new_in_merge", "Прочее")):
                         if sides[key]:
                             body.append("- " + title + ": " + ", ".join("`" + t + "`" for t in sides[key][:15]))
+                    if stop.reason == "model_sees_contradiction":
+                        body.append("\nМодель сочла требования несовместимыми — это её оценка, а не доказательство: "
+                                    "решение, проходящее тесты обеих сторон, может существовать. Выберите поведение.")
                     if stop.reason == "conflicting_requirements":
                         body.append("\nПохоже на **противоречие требований**: тесты обеих сторон нельзя выполнить "
                                     "одновременно. Согласуйте поведение и обновите тесты в одной из веток.")

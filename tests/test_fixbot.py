@@ -15,7 +15,7 @@ import fixbot
 from fixbot import Bot, Stop, preserved_tests
 
 
-SEED = Path(__file__).resolve().parents[2] / "fixbot-lab" / "seed"
+SEED = Path(__file__).resolve().parents[1] / "fixtures" / "fixbot_seed"
 MERGIRAF = Path(__file__).resolve().parents[2] / "github-ci-evidence" / "mergiraf-0.20.0" / "mergiraf.exe"
 TARGET = "feature/lab-main"
 PRICING = (SEED / "shop" / "pricing.py").read_text(encoding="utf-8") if SEED.exists() else ""
@@ -228,6 +228,11 @@ class FixbotTests(unittest.TestCase):
         from queue_repair import RepairError
         result, api, model = self.run_bot("feature/b", sha, ScriptedModel([
             {"shop/pricing.py": minimum}, RepairError("repair_no_changes", "contradiction")]))
+        # Only the PR's tests ever failed: the contradiction is the model's opinion, not a proof.
+        self.assertEqual((result["decision"], result["reason"]), ("rejected", "model_sees_contradiction"))
+        self.assertIn("это её оценка", api.comments[-1])
+        result, api, model = self.run_bot("feature/b", sha, ScriptedModel([
+            {"shop/pricing.py": minimum}, {"shop/pricing.py": gift}]))
         self.assertEqual((result["decision"], result["needs_human"]), ("rejected", True))
         self.assertEqual(result["reason"], "conflicting_requirements")
         self.assertEqual(self.head(TARGET), self.head("feature/a"))  # Nothing published.
@@ -346,9 +351,16 @@ class FixbotTests(unittest.TestCase):
         both = receipt.replace(old_line, sku_line).replace(old_tail, vat_tail)
         with patch.dict(os.environ, {"MERGIRAF_BINARY": ""}):  # Plain git: both files conflict.
             result, api, model = self.run_bot("feature/b", sha, ScriptedModel([{"shop/receipt.py": both}] * 2))
-        self.assertEqual(result["decision"], "merged", result.get("detail"))
+        # The PR rewrote an existing expectation: its owner confirms before anything is merged.
+        self.assertEqual((result["decision"], result["reason"]), ("verified", "needs_confirmation"))
+        self.assertIn("tests/test_receipt.py", result["review"]["edited_existing_tests"])
         self.assertEqual(result["tests_combined"], ["tests/test_receipt.py"])
         self.assertTrue(all("tests/test_receipt.py" not in c["allowed_paths"] for c in model.contexts))
+        self.assertIn("изменил существующие тесты", api.comments[-1])
+        with patch.dict(os.environ, {"MERGIRAF_BINARY": "", "FIXBOT_EXISTING_TEST_EDITS": "allow"}):
+            result, api, model = self.run_bot("feature/b", self.head("feature/b"), ScriptedModel([]))
+        self.assertEqual(result["decision"], "merged", result.get("detail"))
+
         self.git(self.seed, "fetch", "-q", "origin")
         merged = self.git(self.seed, "show", "origin/" + TARGET + ":tests/test_receipt.py")
         self.assertIn('"Чай (a) × 2: 300,00 ₽\\nИтого: 300,00 ₽\\nв т.ч. НДС 20 %: 50,00 ₽"', merged)

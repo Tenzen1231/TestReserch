@@ -1,0 +1,32 @@
+name: PR → итоговый агент
+run-name: 'PR #${{ github.event.number }} — ${{ github.event.action }} — ${{ github.event.pull_request.head.sha }}'
+
+# Runs from the shared branch on every push to a team PR. It only passes the
+# exact PR version to the trusted agent on main; no PR code is executed here.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [feature/lab-main]
+
+permissions:
+  actions: write
+
+jobs:
+  submit:
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hand the exact PR version to the integration agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          for attempt in 1 2 3; do
+            gh workflow run fixbot.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              -f pr_number="$PR_NUMBER" -f head_ref="$HEAD_REF" -f expected_head="$HEAD_SHA" -f reason=pr_event && exit 0
+            sleep $((attempt * 5))
+          done
+          exit 1
