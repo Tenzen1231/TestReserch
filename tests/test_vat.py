@@ -24,7 +24,7 @@ class VatAmountTests(unittest.TestCase):
 class VatReceiptTests(unittest.TestCase):
     def test_vat_line_goes_right_after_total(self):
         text = format_receipt([Item("a", "Чай", 15000, 2)])
-        self.assertEqual(text, "Чай × 2: 300,00 ₽\nИтого: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
+        self.assertEqual(text, "Чай (a) × 2: 300,00 ₽\nИтого: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
 
     def test_vat_is_taken_from_final_total_with_discounts_and_delivery(self):
         text = format_receipt([Item("a", "Кофе", 100000)], Customer("g1", "gold"),
