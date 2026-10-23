@@ -7,7 +7,7 @@ from shop.receipt import format_receipt
 
 class QuantityLimitTests(unittest.TestCase):
     def test_qty_99_is_allowed(self):
-        self.assertEqual(calculate_total([Item("a", "Чай", 100, 99)]), 9900)
+        self.assertEqual(calculate_total([Item("a", "Чай", 200, 99)]), 19800)
 
     def test_qty_above_99_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:

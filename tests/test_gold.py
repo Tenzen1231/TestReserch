@@ -11,10 +11,10 @@ class GoldDiscountTests(unittest.TestCase):
         self.assertEqual(calculate_total(items, Customer("g1", "gold")), 28500)
 
     def test_discount_kopecks_rounded_down_for_shop(self):
-        items = [Item("a", "Булка", 1999)]
-        # 1999 * 5 // 100 = 99 (а не 99,95 -> 100)
-        self.assertEqual(customer_discount(items, Customer("g1", "gold")), 99)
-        self.assertEqual(calculate_total(items, Customer("g1", "gold")), 1900)
+        items = [Item("a", "Булка", 19999)]
+        # 19999 * 5 // 100 = 999 (а не 999,95 -> 1000)
+        self.assertEqual(customer_discount(items, Customer("g1", "gold")), 999)
+        self.assertEqual(calculate_total(items, Customer("g1", "gold")), 19000)
 
     def test_regular_and_no_customer_without_discount(self):
         items = [Item("a", "Чай", 15000, 2)]

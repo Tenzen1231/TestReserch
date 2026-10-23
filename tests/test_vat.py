@@ -37,8 +37,8 @@ class VatReceiptTests(unittest.TestCase):
         self.assertEqual(text.splitlines()[-1], "в т.ч. НДС 20 %: 2 057,61 ₽")
 
     def test_half_kopeck_in_receipt_rounds_up(self):
-        text = format_receipt([Item("a", "Спичка", 3)])
-        self.assertEqual(text.splitlines()[-1], "в т.ч. НДС 20 %: 0,01 ₽")
+        text = format_receipt([Item("a", "Спичка", 10005)])
+        self.assertEqual(text.splitlines()[-1], "в т.ч. НДС 20 %: 16,68 ₽")
 
     def test_zero_total_has_zero_vat(self):
         text = format_receipt([Item("a", "Чай", 15000)], promo_code="MINUS500")

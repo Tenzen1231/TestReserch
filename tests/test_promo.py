@@ -10,8 +10,8 @@ class PromoPricingTests(unittest.TestCase):
         self.assertEqual(calculate_total([Item("a", "Чай", 15000, 2)], promo_code="SAVE10"), 27000)
 
     def test_save10_rounds_discount_down(self):
-        # подытог 999 коп. -> скидка 99 коп., итог 900
-        self.assertEqual(calculate_total([Item("a", "Спички", 999)], promo_code="SAVE10"), 900)
+        # подытог 99999 коп. -> скидка 9999 коп., итог 90000
+        self.assertEqual(calculate_total([Item("a", "Спички", 99999)], promo_code="SAVE10"), 90000)
 
     def test_minus500_subtracts_500_rubles(self):
         self.assertEqual(calculate_total([Item("b", "Кофе", 80000)], promo_code="MINUS500"), 30000)
