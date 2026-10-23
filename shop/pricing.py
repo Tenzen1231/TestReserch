@@ -55,6 +55,8 @@ def price_breakdown(items, customer=None, promo_code=None, *, delivery="pickup")
         raise ValueError("пустой заказ")
     if any(item.qty > MAX_QTY for item in items):
         raise ValueError("слишком много")
+    if any(item.price_cents < 0 for item in items):
+        raise ValueError("цена не может быть отрицательной")
     base = subtotal(items)
     gold = customer_discount(items, customer)
     promo = min(promo_discount(base, promo_code), base - gold)
