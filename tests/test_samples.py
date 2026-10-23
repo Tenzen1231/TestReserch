@@ -19,7 +19,7 @@ class FreeSampleTests(unittest.TestCase):
 
     def test_samples_only_receipt_is_printed(self):
         text = format_receipt([Item("s", "Пробник", 0)])
-        self.assertEqual(text, "Пробник (s) × 1: 0,00 ₽\nИтого: 0,00 ₽\nв т.ч. НДС 20 %: 0,00 ₽")
+        self.assertEqual(text, "Пробник (s) × 1: 0,00 ₽\nИтого к оплате: 0,00 ₽\nв т.ч. НДС 20 %: 0,00 ₽")
 
     def test_negative_price_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:

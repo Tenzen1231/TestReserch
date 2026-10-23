@@ -27,11 +27,11 @@ class QuantityLimitTests(unittest.TestCase):
 class ReceiptSkuTests(unittest.TestCase):
     def test_line_shows_sku(self):
         text = format_receipt([Item("a", "Чай", 15000, 2)])
-        self.assertEqual(text, "Чай (a) × 2: 300,00 ₽\nИтого: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
+        self.assertEqual(text, "Чай (a) × 2: 300,00 ₽\nИтого к оплате: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
 
     def test_each_line_shows_its_own_sku(self):
         text = format_receipt([Item("a", "Чай", 15000, 2), Item("b", "Кофе", 40000)])
-        self.assertEqual(text, "Чай (a) × 2: 300,00 ₽\nКофе (b) × 1: 400,00 ₽\nИтого: 700,00 ₽\nв т.ч. НДС 20 %: 116,67 ₽")
+        self.assertEqual(text, "Чай (a) × 2: 300,00 ₽\nКофе (b) × 1: 400,00 ₽\nИтого к оплате: 700,00 ₽\nв т.ч. НДС 20 %: 116,67 ₽")
 
 
 if __name__ == "__main__":
