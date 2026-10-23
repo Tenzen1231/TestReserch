@@ -241,8 +241,8 @@ class FixbotTests(unittest.TestCase):
                 {"shop/pricing.py": GOLD, "tests/test_pricing.py": weakened},
                 {"shop/pricing.py": GOLD, "tests/test_pricing.py": weakened}]))
         self.assertEqual((result["decision"], result["needs_human"]), ("rejected", True))
-        altered = result["escalation"]["failure"]["tests"]["altered_tests"]
-        self.assertTrue(any("PromoTests.test_save10" in item for item in altered))
+        self.assertEqual([item["state"] for item in result["repairs"]], ["rejected_test_edit"] * 2)
+        self.assertEqual(self.head(TARGET), self.head("feature/a"))
 
     def test_deleting_another_features_test_needs_a_human(self):
         start = self.head(TARGET)
@@ -261,6 +261,21 @@ class FixbotTests(unittest.TestCase):
         result, api, model = self.run_bot("feature/b", sha, model)
         self.assertEqual((result["decision"], result["reason"]), ("rejected", "repair_scope_violation"))
         self.assertEqual(self.head(TARGET), self.head("feature/a"))
+
+    def test_module_level_patch_in_a_test_file_cannot_make_other_tests_pass(self):
+        start = self.head(TARGET)
+        broken = PRICING.replace("    return subtotal(items)\n", "    return 1\n")
+        poison = ("import unittest\nunittest.TestCase.assertEqual = lambda *args, **kwargs: None\n\n\n"
+                  "class Mine(unittest.TestCase):\n    def test_mine(self):\n        self.assertEqual(1, 2)\n")
+        sha = self.branch("feature/b", start, {"shop/pricing.py": broken, "tests/test_aaa.py": poison})
+        result, api, model = self.run_bot("feature/b", sha, ScriptedModel([{"shop/pricing.py": broken}] * 2))
+        self.assertEqual(result["decision"], "rejected")
+        self.assertEqual(self.head(TARGET), start)
+
+    def test_shared_test_infrastructure_change_needs_a_human(self):
+        sha = self.branch("feature/b", self.head(TARGET), {"tests/__init__.py": "import shop\n"})
+        result, api, model = self.run_bot("feature/b", sha)
+        self.assertEqual((result["decision"], result["reason"]), ("rejected", "test_infrastructure_changed"))
 
     def test_protected_paths_are_never_merged(self):
         sha = self.branch("feature/b", self.head(TARGET), {".github/workflows/evil.yml": "on: push\n"})

@@ -68,6 +68,10 @@ def is_test(path):
     return path.startswith(TEST_PREFIX) and path.endswith(".py")
 
 
+def is_test_module(path):
+    return is_test(path) and PurePosixPath(path).name.startswith("test")
+
+
 def is_product(path):
     return path.startswith(PRODUCT_PREFIXES) and path.endswith(".py")
 
@@ -316,6 +320,10 @@ class Bot:
         outside = [p for p in own if not (is_product(p) or is_test(p) or p.endswith(FREE_SUFFIXES))]
         if outside:
             raise Stop("rejected", "protected_paths", ", ".join(outside), needs_human=True)
+        # Shared test infrastructure (tests/__init__.py, helpers) runs inside everyone's tests.
+        infrastructure = [p for p in own if is_test(p) and not is_test_module(p) and self.show(base, p) is not None]
+        if infrastructure:
+            raise Stop("rejected", "test_infrastructure_changed", ", ".join(infrastructure), needs_human=True)
         target_tests, head_tests = self.tests(target, "list"), self.tests(head, "list")
         required = sorted(set(target_tests["ids"]) | set(head_tests["ids"]))
         self.result["required_tests"] = len(required)
@@ -437,6 +445,16 @@ class Bot:
         for path, content in proposal["files"].items():
             if path not in allowed or (worktree / path).is_symlink():
                 raise Stop("rejected", "repair_scope_violation", path, needs_human=True)
+            if is_test(path):
+                # In a test file the model may only drop conflict markers: every line it
+                # returns must come verbatim from one of the two sides.
+                sides = set((self.show(target, path) or "").splitlines()) | set((self.show(head, path) or "").splitlines())
+                foreign = [line for line in content.splitlines() if line not in sides]
+                if foreign:
+                    record.update(state="rejected_test_edit", foreign_lines=foreign[:10])
+                    self.save()
+                    return
+        for path, content in proposal["files"].items():
             (worktree / path).write_text(content, encoding="utf-8", newline="\n")
         self.save()
 
