@@ -3,6 +3,7 @@
 COURIER_FEE_CENTS = 30000
 FREE_COURIER_FROM_CENTS = 300000
 DELIVERY_METHODS = ("pickup", "courier")
+MAX_QTY = 99
 
 
 def line_total(item):
@@ -52,6 +53,8 @@ def price_breakdown(items, customer=None, promo_code=None, *, delivery="pickup")
     """Слагаемые итога: обе скидки считаются от подытога, товары не дешевле 0, доставка сверху."""
     if not items:
         raise ValueError("пустой заказ")
+    if any(item.qty > MAX_QTY for item in items):
+        raise ValueError("слишком много")
     base = subtotal(items)
     gold = customer_discount(items, customer)
     promo = min(promo_discount(base, promo_code), base - gold)

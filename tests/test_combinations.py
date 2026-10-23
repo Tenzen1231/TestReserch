@@ -30,5 +30,5 @@ class CombinationTests(unittest.TestCase):
 
     def test_receipt_lines_add_up_to_the_total(self):
         text = format_receipt([Item("a", "Кофе", 100000)], GOLD, promo_code="SAVE10", delivery="courier")
-        self.assertEqual(text, "Кофе × 1: 1 000,00 ₽\nСкидка клиента: −50,00 ₽\nПромокод SAVE10: −100,00 ₽\n"
+        self.assertEqual(text, "Кофе (a) × 1: 1 000,00 ₽\nСкидка клиента: −50,00 ₽\nПромокод SAVE10: −100,00 ₽\n"
                                "Доставка: 300,00 ₽\nИтого: 1 150,00 ₽")
