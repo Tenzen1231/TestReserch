@@ -417,8 +417,8 @@ class Bot:
             if review["required"] and not approved:
                 # Tests passed, but the model rewrote lines of a sensitive path: a human
                 # confirms its decisions (label fixbot-approved) before anything is merged.
-                self.status(candidate, "pending", "Проверено; решения модели ждут подтверждения человеком")
-                self.comment(number, self.summary("Нужно подтверждение решений модели (метка fixbot-approved)", candidate))
+                self.status(candidate, "pending", "Проверено; ждёт подтверждения человеком (метка fixbot-approved)")
+                self.comment(number, self.summary("Нужно подтверждение человека (метка fixbot-approved)", candidate))
                 raise Stop("verified", "needs_confirmation")
             if os.environ.get("FIXBOT_AUTO_MERGE", "true") != "true":
                 self.status(candidate, "success", "Проверено против " + target[:8] + "; можно вливать")
