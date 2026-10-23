@@ -27,11 +27,11 @@ class GoldDiscountTests(unittest.TestCase):
         text = format_receipt([Item("a", "Чай", 15000, 2)], Customer("g1", "gold"))
         self.assertEqual(
             text,
-            "Чай (a) × 2: 300,00 ₽\nСкидка клиента: −15,00 ₽\nИтого: 285,00 ₽\nв т.ч. НДС 20 %: 47,50 ₽",
+            "Чай (a) x 2: 300,00 ₽\nСкидка клиента: −15,00 ₽\nИтого: 285,00 ₽\nв т.ч. НДС 20 %: 47,50 ₽",
         )
 
     def test_regular_receipt_unchanged(self):
         items = [Item("a", "Чай", 15000, 2)]
-        expected = "Чай (a) × 2: 300,00 ₽\nИтого: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽"
+        expected = "Чай (a) x 2: 300,00 ₽\nИтого: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽"
         self.assertEqual(format_receipt(items, Customer("c1")), expected)
         self.assertEqual(format_receipt(items), expected)
