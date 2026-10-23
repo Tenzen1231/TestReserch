@@ -10,7 +10,7 @@ class VatAmountTests(unittest.TestCase):
         self.assertEqual(vat_included(0), 0)
 
     def test_half_kopeck_rounds_up(self):
-        # 3 × 20 / 120 = 0,5 коп. -> 1; 9 -> 1,5 -> 2
+        # 3 x 20 / 120 = 0,5 коп. -> 1; 9 -> 1,5 -> 2
         self.assertEqual(vat_included(3), 1)
         self.assertEqual(vat_included(9), 2)
 
@@ -24,7 +24,7 @@ class VatAmountTests(unittest.TestCase):
 class VatReceiptTests(unittest.TestCase):
     def test_vat_line_goes_right_after_total(self):
         text = format_receipt([Item("a", "Чай", 15000, 2)])
-        self.assertEqual(text, "Чай (a) × 2: 300,00 ₽\nИтого к оплате: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
+        self.assertEqual(text, "Чай (a) x 2: 300,00 ₽\nИтого к оплате: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
 
     def test_vat_is_taken_from_final_total_with_discounts_and_delivery(self):
         text = format_receipt([Item("a", "Кофе", 100000)], Customer("g1", "gold"),
