@@ -30,15 +30,15 @@ class PromoPricingTests(unittest.TestCase):
 class PromoReceiptTests(unittest.TestCase):
     def test_receipt_shows_save10_line_before_total(self):
         text = format_receipt([Item("a", "Чай", 15000, 2)], promo_code="SAVE10")
-        self.assertEqual(text, "Чай (a) x 2: 300,00 ₽\nПромокод SAVE10: −30,00 ₽\nИтого к оплате: 270,00 ₽\nв т.ч. НДС 20 %: 45,00 ₽")
+        self.assertEqual(text, "Чай (a) x 2: 300,00 ₽\nПромокод SAVE10: −30,00 ₽\nК оплате: 270,00 ₽\nв т.ч. НДС 20 %: 45,00 ₽")
 
     def test_receipt_shows_capped_minus500(self):
         text = format_receipt([Item("a", "Чай", 15000)], promo_code="MINUS500")
-        self.assertEqual(text, "Чай (a) x 1: 150,00 ₽\nПромокод MINUS500: −150,00 ₽\nИтого к оплате: 0,00 ₽\nв т.ч. НДС 20 %: 0,00 ₽")
+        self.assertEqual(text, "Чай (a) x 1: 150,00 ₽\nПромокод MINUS500: −150,00 ₽\nК оплате: 0,00 ₽\nв т.ч. НДС 20 %: 0,00 ₽")
 
     def test_receipt_without_code_unchanged(self):
         text = format_receipt([Item("a", "Чай", 15000, 2)])
-        self.assertEqual(text, "Чай (a) x 2: 300,00 ₽\nИтого к оплате: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
+        self.assertEqual(text, "Чай (a) x 2: 300,00 ₽\nК оплате: 300,00 ₽\nв т.ч. НДС 20 %: 50,00 ₽")
 
 
 if __name__ == "__main__":
