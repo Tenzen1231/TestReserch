@@ -44,7 +44,12 @@ A pull request branch was merged with the current shared branch. Resolve what re
 sides keep working: the shared branch already contains other developers' accepted features, the pull
 request adds its own feature. Each side's intent is its delta from common_ancestor; the PR description and
 target_history describe them. Keep every behaviour of both sides; never delete or weaken another side's
-logic to make tests pass. You may only return files listed in allowed_paths. Test files appear in
+logic to make tests pass. Apply each side's change literally: keep each side's formulas, the base each
+computation uses, rounding, messages and output lines exactly as that side wrote them (two discounts written
+against the same subtotal both stay computed from that subtotal). Keep every existing positional parameter at
+its position; when two sides add a parameter at the same position, make the newly added ones keyword-only.
+In "explanation" list every behaviour decision that neither side's code nor tests dictate.
+You may only return files listed in allowed_paths. Test files appear in
 allowed_paths only when they are conflicted; then you must keep every test function of both sides exactly
 as written and only remove conflict markers. Return one JSON object with exactly two keys: "files" (allowed
 relative path -> complete new UTF-8 file text, changed files only) and "explanation" (short, Russian).
@@ -113,6 +118,43 @@ def preserved_tests(base, target, source, candidate):
             expected = right if left == old else left
         if sides["candidate"].get(name) != expected:
             problems.append(name + ": missing or altered in the merged result")
+    return problems
+
+
+def meaningful(text):
+    return {line.strip() for line in (text or "").splitlines()
+            if line.strip() and not line.strip().startswith("#")}
+
+
+def altered_lines(base, side, candidate):
+    """Lines a side added that do not survive verbatim: decisions a human should see."""
+    return sorted(meaningful(side) - meaningful(base) - meaningful(candidate))
+
+
+def positional(text):
+    """Function name -> positional parameter names (module level and class methods)."""
+    try:
+        tree = ast.parse(text or "")
+    except SyntaxError:
+        return {}
+    found = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+            found[node.name] = [arg.arg for arg in node.args.posonlyargs + node.args.args]
+    return found
+
+
+def moved_parameters(side, candidate):
+    """Positional parameters of a side that moved or vanished: old positional calls would break."""
+    merged = positional(candidate)
+    problems = []
+    for name, params in positional(side).items():
+        if name not in merged:
+            problems.append(name + ": функция исчезла")
+            continue
+        for index, param in enumerate(params):
+            if index >= len(merged[name]) or merged[name][index] != param:
+                problems.append(name + ": параметр " + param + " больше не на позиции " + str(index + 1))
     return problems
 
 
@@ -272,6 +314,28 @@ class Bot:
             raise Stop("rejected", "invalid_branch", pr["head"]["ref"], needs_human=True)
         return pr
 
+    def review(self, target, head, candidate):
+        """What the merge changed in each author's own lines and APIs, for the PR comment."""
+        base = self.result.get("base") or self.text("merge-base", target, head)
+        report = {"altered": {}, "moved_parameters": {}, "required": False}
+        sensitive = [prefix for prefix in os.environ.get("FIXBOT_REVIEW_PATHS", "").split(",") if prefix]
+        if candidate == head:  # Nothing was merged or rewritten by the agent.
+            self.result["review"] = report
+            return report
+        for side_name, side in (("shared", target), ("pull_request", head)):
+            for path in sorted(p for p in set(self.changed(base, side)) if is_product(p)):
+                lost = altered_lines(self.show(base, path), self.show(side, path), self.show(candidate, path))
+                moved = moved_parameters(self.show(side, path), self.show(candidate, path))
+                if lost:
+                    report["altered"].setdefault(side_name, {})[path] = lost[:20]
+                if moved:
+                    report["moved_parameters"].setdefault(side_name, {})[path] = moved
+                if (lost or moved) and any(path.startswith(prefix) for prefix in sensitive):
+                    report["required"] = True
+        self.result["review"] = report
+        self.save()
+        return report
+
     def fetch(self, head_ref):
         prefix = "refs/fixbot/" + uuid.uuid4().hex
         self.git("fetch", "--quiet", "--no-tags", "origin", "refs/heads/" + TARGET + ":" + prefix + "/target",
@@ -296,6 +360,14 @@ class Bot:
                 self.step("push_pr_branch", candidate=candidate, returncode=push.returncode)
                 if push.returncode:
                     raise Stop("skipped", "superseded", "The author pushed during the run; the new push is checked")
+            review = self.review(target, head, candidate)
+            approved = "fixbot-approved" in {label.get("name") for label in pr.get("labels", [])}
+            if review["required"] and not approved:
+                # Tests passed, but the model rewrote lines of a sensitive path: a human
+                # confirms its decisions (label fixbot-approved) before anything is merged.
+                self.status(candidate, "pending", "Проверено; решения модели ждут подтверждения человеком")
+                self.comment(number, self.summary("Нужно подтверждение решений модели (метка fixbot-approved)", candidate))
+                raise Stop("verified", "needs_confirmation")
             if os.environ.get("FIXBOT_AUTO_MERGE", "true") != "true":
                 self.status(candidate, "success", "Проверено против " + target[:8] + "; можно вливать")
                 raise Stop("verified", "ready_to_merge")
@@ -485,6 +557,14 @@ class Bot:
         for item in repairs:
             lines.append("  - " + str(item.get("ordinal")) + ": " + str(item.get("state")) + " — "
                          + str(item.get("explanation") or item.get("reason") or ""))
+        review = self.result.get("review") or {}
+        if review.get("altered") or review.get("moved_parameters"):
+            lines += ["", "**Проверьте решения модели** — строки авторов, которые не сохранились дословно:"]
+            for side, title in (("shared", "общая ветка"), ("pull_request", "этот PR")):
+                for path, items in (review.get("altered", {}).get(side) or {}).items():
+                    lines.append("- " + title + ", `" + path + "`: " + "; ".join("`" + i[:80] + "`" for i in items[:8]))
+                for path, items in (review.get("moved_parameters", {}).get(side) or {}).items():
+                    lines.append("- " + title + ", `" + path + "`, API: " + "; ".join(items))
         return "\n".join(lines)
 
     def requeue_others(self, merged):
@@ -555,7 +635,7 @@ def sweep(api, run_id):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("fix", "sweep"))
+    parser.add_argument("mode", choices=("fix", "sweep", "guard"))
     parser.add_argument("--repo", default=".")
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--pr", type=int)
@@ -570,6 +650,17 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{40}", args.expected_head):
         raise SystemExit("--expected-head must be an exact commit SHA")
     bot = Bot(args.repo, args.state_dir)
+    if args.mode == "guard":
+        # Cheap early exit before the sandbox and Mergiraf are installed.
+        try:
+            bot.guard(args.pr, args.expected_head)
+            proceed = "true"
+        except Stop as stop:
+            proceed = "false"
+            print("skip:", stop.reason)
+        with open(os.environ.get("GITHUB_OUTPUT", os.devnull), "a", encoding="utf-8") as stream:
+            stream.write("proceed=" + proceed + "\n")
+        return 0
     try:
         bot.fix(args.pr, args.expected_head)
         return 0

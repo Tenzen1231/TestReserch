@@ -301,6 +301,36 @@ class FixbotTests(unittest.TestCase):
         self.assertEqual(self.git(self.seed, "log", "-1", "--format=%s", newer), "author keeps working")
         self.assertEqual(self.head(TARGET), self.head("feature/a"))
 
+    def test_model_decisions_are_reported_and_sensitive_paths_wait_for_a_human(self):
+        start = self.head(TARGET)
+        self.branch("feature/a", start, {"shop/pricing.py": PROMO})
+        self.merge_into_target("feature/a")
+        sha = self.branch("feature/b", start, {"shop/pricing.py": GOLD})
+        with patch.dict(os.environ, {"FIXBOT_REVIEW_PATHS": "shop/"}):
+            result, api, model = self.run_bot("feature/b", sha, ScriptedModel([{"shop/pricing.py": BOTH}]))
+        self.assertEqual((result["decision"], result["reason"]), ("verified", "needs_confirmation"))
+        self.assertIn("total -= total // 10", result["review"]["altered"]["shared"]["shop/pricing.py"])
+        self.assertEqual(self.head(TARGET), self.head("feature/a"))  # Nothing merged without a human.
+        self.assertIn("Проверьте решения модели", api.comments[-1])
+        fixed = self.head("feature/b")  # The verified merge waits in the PR branch.
+        self.assertNotEqual(fixed, sha)
+        api_pr = {"number": 7, "state": "open", "draft": False, "title": "PR", "body": "feature",
+                  "labels": [{"name": "fixbot-approved"}],
+                  "head": {"ref": "feature/b", "sha": fixed, "repo": {"full_name": FakeGitHub.repository}},
+                  "base": {"ref": TARGET, "repo": {"full_name": FakeGitHub.repository}}}
+        approved = FakeGitHub(api_pr)
+        bot = Bot(self.bot_repo, self.root / "approved", api=approved, client_factory=lambda p, o: ScriptedModel([]))
+        with patch.dict(os.environ, {"FIXBOT_REVIEW_PATHS": "shop/"}):
+            bot.fix(7, fixed)
+        self.assertEqual((bot.result["decision"], self.head(TARGET)), ("merged", fixed))
+
+    def test_moved_positional_parameters_are_detected(self):
+        side = "def total(items, customer=None, delivery='pickup'):\n    return 1\n"
+        merged = "def total(items, customer=None, promo_code=None, delivery='pickup'):\n    return 1\n"
+        self.assertEqual(fixbot.moved_parameters(side, merged), ["total: параметр delivery больше не на позиции 3"])
+        keyword_only = "def total(items, customer=None, *, promo_code=None, delivery='pickup'):\n    return 1\n"
+        self.assertEqual(fixbot.moved_parameters("def total(items, customer=None):\n    return 1\n", keyword_only), [])
+
     def test_preserved_tests_rule(self):
         base = "def test_a():\n    assert 1\n"
         self.assertEqual(preserved_tests(base, base + "def test_b():\n    assert 2\n", base + "def test_c():\n    assert 3\n",

@@ -53,7 +53,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Is this PR version still open and current?
+        id: guard
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python fixbot.py guard --state-dir "$RUNNER_TEMP/fixbot" --pr "$PR_NUMBER" --expected-head "$EXPECTED_HEAD"
+
       - name: Prepare isolated test image
+        if: steps.guard.outputs.proceed == 'true'
         run: |
           for attempt in 1 2 3; do
             docker pull python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2 && exit 0
@@ -62,6 +69,7 @@ jobs:
           exit 1
 
       - name: Install verified Mergiraf 0.20.0
+        if: steps.guard.outputs.proceed == 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/mergiraf"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
@@ -75,6 +83,7 @@ jobs:
           echo "MERGIRAF_BINARY=$binary" >> "$GITHUB_ENV"
 
       - name: Load publisher key
+        if: steps.guard.outputs.proceed == 'true'
         env:
           QUEUE_DEPLOY_KEY: ${{ secrets.QUEUE_DEPLOY_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -104,6 +113,7 @@ jobs:
           echo "GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/github_known_hosts" >> "$GITHUB_ENV"
 
       - name: Merge the shared branch into the PR, repair, test, publish
+        if: steps.guard.outputs.proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           ROUTERAI_API_KEY: ${{ secrets.ROUTERAI_API_KEY }}
