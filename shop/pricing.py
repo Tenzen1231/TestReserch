@@ -48,10 +48,18 @@ def customer_discount(items, customer=None):
     return subtotal(items) * GOLD_DISCOUNT_PERCENT // 100
 
 
-def calculate_total(items, customer=None, promo_code=None, delivery="pickup"):
-    """Итоговая сумма заказа в копейках."""
+def price_breakdown(items, customer=None, promo_code=None, *, delivery="pickup"):
+    """Слагаемые итога: обе скидки считаются от подытога, товары не дешевле 0, доставка сверху."""
     if not items:
         raise ValueError("пустой заказ")
-    amount = subtotal(items) - customer_discount(items, customer)
-    amount -= promo_discount(amount, promo_code)
-    return amount + delivery_cost(items, delivery)
+    base = subtotal(items)
+    gold = customer_discount(items, customer)
+    promo = min(promo_discount(base, promo_code), base - gold)
+    delivery_cents = delivery_cost(items, delivery)
+    return {"subtotal": base, "customer_discount": gold, "promo_discount": promo,
+            "delivery": delivery_cents, "total": base - gold - promo + delivery_cents}
+
+
+def calculate_total(items, customer=None, promo_code=None, *, delivery="pickup"):
+    """Итоговая сумма заказа в копейках."""
+    return price_breakdown(items, customer, promo_code=promo_code, delivery=delivery)["total"]
