@@ -6,16 +6,25 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: routerai-probe
+  cancel-in-progress: false
+
 jobs:
   probe:
-    if: github.ref == 'refs/heads/main'
+    # Paid secret: only the repository owner may start or re-run the measurement.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && github.actor == github.repository_owner
+      && github.triggering_actor == github.repository_owner
     runs-on: ubuntu-latest
     environment: queue-publisher
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline-8k, queue-profile-1, queue-profile-2, effort-none-8k, thinking-32k]
+        variant: [baseline-8k, default-low-16k, default-off-8k, pinned-low-16k, pinned-off-16k, pinned-think-32k]
+        case: [bob-r2, carol-r2, carol-3way]
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -31,13 +40,13 @@ jobs:
       - name: Measure one parameter variant
         env:
           ROUTERAI_API_KEY: ${{ secrets.ROUTERAI_API_KEY }}
-        run: python probe_routerai.py "${{ matrix.variant }}"
+        run: python probe_routerai.py "${{ matrix.variant }}" "${{ matrix.case }}"
 
       - name: Upload measurement
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: probe-${{ matrix.variant }}
+          name: probe-${{ matrix.variant }}-${{ matrix.case }}
           path: ${{ runner.temp }}/probe/probe-*.json
           if-no-files-found: warn
           retention-days: 30

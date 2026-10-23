@@ -283,7 +283,7 @@ class QueueRepairTests(unittest.TestCase):
             self.assertEqual(metadata["usage"]["total_tokens"], 130)
             self.assertGreaterEqual(metadata["elapsed_seconds"], 0)
             self.assertEqual(set(metadata), {"request_sha256", "response_sha256", "id", "requested_model",
-                                              "returned_model", "usage", "elapsed_seconds", "request_parameters",
+                                              "returned_model", "usage", "elapsed_seconds", "request_parameters", "provider",
                                               "profile", "timeout_seconds", "request_sent", "response_received", "http_status",
                                               "response_bytes", "response_shape"})
             self.assertEqual((metadata["request_sent"], metadata["response_received"], metadata["http_status"]),

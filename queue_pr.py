@@ -44,7 +44,7 @@ def validate_pr(pr, repository, number, expected_head=None, source=None, require
     if any((item.get("repo") or {}).get("full_name") != repository for item in (head, base)):
         raise PRError("invalid_pr", "Only same-repository PRs are supported")
     branch, sha = head.get("ref", ""), head.get("sha", "")
-    if (base.get("ref") != TARGET or not re.fullmatch(r"feature/[A-Za-z0-9][A-Za-z0-9._/-]*", branch)
+    if (base.get("ref") != TARGET or not re.fullmatch(r"feature/[A-Za-z0-9][A-Za-z0-9._/-]{0,100}", branch)
             or branch in {TARGET, STATE_BRANCH} or ".." in branch
             or not re.fullmatch(r"[0-9a-f]{40}", sha)):
         raise PRError("invalid_pr", "Unexpected target or source reference")

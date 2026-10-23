@@ -14,6 +14,7 @@ from queue_gate import Gate, Rejected
 from queue_repair import RepairError
 from queue_structural import StructuralError
 from queue_budget import BudgetError
+from queue_status import StatusError
 import test_queue_status as fixture
 
 
@@ -150,7 +151,11 @@ class QueueAutorepairTests(unittest.TestCase):
         model = Mock()
         def propose(context):
             order.append("post")
-            self.assertIn("combined:0", [item["check"] for item in context["acceptance_examples"]])
+            shown = [item["check"] for item in context["new_requirement_examples"]]
+            self.assertTrue(shown and all(name.startswith(("fee:", "combined:")) for name in shown))
+            self.assertFalse(any(gate.hidden(name) for name in shown))
+            self.assertEqual(context["changed_paths"], ["money.py"])
+            self.assertIn("||||||| ", context["current_candidate"]["money.py"])  # zdiff3 ancestor section
             return dict(self.proposal(COMBINED), metadata={"request_sent": True, "response_received": True})
         model.propose.side_effect = propose
         def reserve(*args, **kwargs):
@@ -166,19 +171,52 @@ class QueueAutorepairTests(unittest.TestCase):
         self.assertEqual(gate.result["repair_accounting"], {"reserved": 1, "request_sent": 1, "response_received": 1,
                                                             "proposed": 1, "validated": 1, "published": 1})
 
-    def test_reservation_without_request_is_not_counted_as_a_model_call(self):
+    def test_missing_key_is_detected_before_any_reservation(self):
         self.accept_discount()
         self.branch("feature/fee", self.start, {"money.py": FEE})
-        gate = self.gate("not-sent", "feature/fee", "fee")
-        with patch("queue_gate.RouterRepairClient.from_environment",
-                   side_effect=RepairError("repair_missing_credentials", "No key")):
+        gate = self.gate("no-key", "feature/fee", "fee")
+        reserve = Mock()
+        with patch.dict(os.environ, QUEUE_DURABLE_BUDGET="true"), patch("queue_gate.reserve_budget", reserve),                 patch("queue_gate.RouterRepairClient.from_environment",
+                      side_effect=RepairError("repair_missing_credentials", "No key")):
             with self.assertRaises(Rejected) as error:
                 gate.prepare(gate.args)
-        self.assertEqual(error.exception.reason, "repair_exhausted")
-        gate.reject(error.exception.reason)
-        gate.output()
-        self.assertEqual(gate.result["repair_accounting"]["reserved"], 2)
-        self.assertEqual(gate.result["repair_accounting"]["request_sent"], 0)
+        self.assertEqual(error.exception.reason, "repair_unavailable")
+        reserve.assert_not_called()
+        self.assertEqual(gate.result["repairs"], [])
+
+    def test_github_read_failure_before_reservation_spends_nothing(self):
+        self.accept_discount()
+        self.branch("feature/fee", self.start, {"money.py": FEE})
+        gate = self.gate("pr-read", "feature/fee", "fee")
+        reserve, model = Mock(), Mock()
+        def check_pr(stage):
+            if stage == "before_repair_reservation":
+                raise StatusError("GitHub status API returned HTTP 500", transient=True)
+        with patch.dict(os.environ, QUEUE_DURABLE_BUDGET="true"), patch("queue_gate.reserve_budget", reserve),                 patch.object(gate, "check_pr", side_effect=check_pr),                 patch("queue_gate.RouterRepairClient.from_environment", return_value=model):
+            with self.assertRaises(StatusError):
+                gate.prepare(gate.args)
+        reserve.assert_not_called()
+        model.propose.assert_not_called()
+        self.assertEqual(gate.result["repairs"], [])
+
+    def test_refusal_given_to_the_model_is_only_the_failed_literal_checks(self):
+        self.accept_discount()
+        wrong = ("def price_units(amount, discount_percent=0, fee_kopeks=0):\n"
+                 "    return round((float(amount)*100+fee_kopeks)*(100-discount_percent)/100)\n")
+        self.branch("feature/fee", self.remote_head(), {"money.py": wrong})
+        gate = self.gate("compact", "feature/fee", "fee")
+        client = Mock()
+        client.propose.return_value = self.proposal(COMBINED)
+        with patch("queue_gate.RouterRepairClient.from_environment", return_value=client):
+            gate.prepare(gate.args)
+        context = client.propose.call_args.args[0]
+        refusal = context["refusal"]
+        self.assertEqual(set(refusal), {"reason", "failed_checks", "failed_total", "failed_hidden"})
+        self.assertEqual(refusal["failed_total"], len(refusal["failed_checks"]) + refusal["failed_hidden"])
+        self.assertFalse(any(gate.hidden(check["check"]) for check in refusal["failed_checks"]))
+        self.assertTrue(all(not check.get("passed") and "check" in check for check in refusal["failed_checks"]))
+        self.assertNotIn("stdout", json.dumps(refusal))
+        self.assertLess(len(json.dumps(context, ensure_ascii=False).encode()), 64 * 1024)
 
     def test_job_rerun_does_not_reset_budget(self):
         self.accept_discount()
@@ -294,7 +332,7 @@ class QueueAutorepairTests(unittest.TestCase):
         self.assertEqual(error.exception.reason, "repair_exhausted")
         self.assertEqual(model.propose.call_count, 2)
         self.assertEqual(ledger.call_count, 2)
-        self.assertEqual([call.kwargs["profile"] for call in client.call_args_list], [1, 2])
+        self.assertEqual([call.kwargs["profile"] for call in client.call_args_list if "profile" in call.kwargs], [1, 2])
         self.assertEqual([item["profile"] for item in gate.result["repairs"]], [1, 2])
         repeated = self.gate("durable-new-run", "feature/fee", "fee")
         with patch.dict(os.environ, QUEUE_DURABLE_BUDGET="true", GITHUB_RUN_ID="999"), \
@@ -304,7 +342,7 @@ class QueueAutorepairTests(unittest.TestCase):
                 repeated.prepare(repeated.args)
         self.assertEqual(error.exception.reason, "repair_exhausted")
         self.assertEqual(repeated.result["repairs"], [])
-        no_model.assert_not_called()
+        no_model.return_value.propose.assert_not_called()  # Preflight builds the client; no request is sent.
 
     def test_source_push_after_prepare_stops_old_request_before_publication(self):
         gate = self.gate("stale", "feature/source", "baseline")

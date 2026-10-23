@@ -290,6 +290,15 @@ sys.exit(queue_gate.main())
         self.assertEqual(self.remote_head(), self.base)
         self.assertEqual(len(self.api.posts), count)
 
+    def test_finalize_never_turns_a_confirmed_publication_into_an_error(self):
+        self.assertEqual(self.phase("prepare")[0], 0)
+        self.api.fail_states.add("success")
+        self.assertEqual(self.phase("publish")[1]["status_delivery"], "failed")
+        self.api.fail_states.update({"error", "failure"})
+        code, result = self.phase("finalize")
+        self.assertEqual((code, result["decision"], result["status_delivery"]), (0, "accepted", "failed"))
+        self.assertFalse(any(body["state"] != "pending" for _, body in self.api.posts))
+
     def test_job_killed_during_prepare_does_not_leave_pending(self):
         wrapper = """import queue_gate, os, sys
 def killed(self, observation, trigger):

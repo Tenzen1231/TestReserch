@@ -34,7 +34,8 @@ MAX_REPAIRS = 2
 VALIDATION_IMAGE = "python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2"
 INFRASTRUCTURE_ERRORS = {"internal_error", "git_error", "status_delivery_failed", "trusted_control_changed",
                          "publication_unconfirmed", "validation_infrastructure_error", "candidate_not_observed",
-                         "structural_infrastructure_error", "budget_unavailable", "setup_failed", "interrupted"}
+                         "structural_infrastructure_error", "budget_unavailable", "setup_failed", "interrupted",
+                         "repair_unavailable"}
 REASONS_RU = {
     "validation_failed": "проверки общего результата не пройдены",
     "merge_conflict": "изменения конфликтуют с общей веткой",
@@ -62,6 +63,7 @@ REASONS_RU = {
     "structural_infrastructure_error": "не удалось запустить проверенный Mergiraf",
     "budget_unavailable": "не удалось подтвердить сохранённый лимит ремонта",
     "setup_failed": "подготовка очереди не завершилась; заявка будет повторена",
+    "repair_unavailable": "ремонт ИИ недоступен до запроса; попытка не израсходована",
 }
 
 
@@ -409,33 +411,55 @@ class Gate:
             raise Rejected("validation_failed", "Trusted acceptance checks rejected the tested snapshot")
         return candidate, tree
 
+    @staticmethod
+    def hidden(name):
+        # About a third of the literal checks are never shown to the model, so a
+        # table of memorised answers cannot pass the trusted validator.
+        return int(hashlib.sha256(name.encode("utf-8")).hexdigest(), 16) % 3 == 0
+
+    def refusal(self, reason):
+        # Only the failed visible literal checks: the full report would expose
+        # hidden checks and could exceed the context limit after a reservation.
+        report = (self.result.get("validation") or {}).get("report") or {}
+        failed = [check for check in report.get("checks", []) if not check.get("passed")]
+        visible = [{key: check[key] for key in ("check", "expected", "actual", "error", "flags") if key in check}
+                   for check in failed if not self.hidden(check.get("check", ""))]
+        return {"reason": reason, "failed_checks": visible[:80], "failed_total": len(failed),
+                "failed_hidden": len(failed) - len(visible)}
+
     def repair_context(self, directory, common, source, base, refusal):
+        conflicts = sorted(self.text("diff", "--name-only", "--diff-filter=U", cwd=directory).splitlines())
+        changed = sorted((set(self.paths(common, base)) | set(self.paths(common, source)) | set(conflicts)) & ALLOWED)
+
         def snapshot(commit):
             files = {}
-            for name in sorted(ALLOWED):
+            for name in changed:
                 result = self.git("show", commit + ":" + name, check=False)
                 if result.returncode == 0:
                     files[name] = result.stdout
             return files
+
+        known = {case[0] for case in contract_cases(self.state.get("accepted_requirements", []))}
+        examples = [{"check": name, "call": module + "." + function + "(" + ", ".join(
+            [repr(arg) for arg in args] + [key + "=" + repr(value) for key, value in kwargs.items()]) + ")",
+            "expected": expected} for name, module, function, args, kwargs, expected
+            in contract_cases(self.state["requirements"]) if name not in known and not self.hidden(name)]
         return {
             "allowed_paths": sorted(ALLOWED),
             "requirements": {key: CONTRACTS[key] for key in self.state["requirements"]},
-            # The same literal oracle the candidate must pass; it is data for the
-            # model, while the trusted validator stays outside its reach.
-            "acceptance_examples": [{"check": name, "call": module + "." + function + "(" + ", ".join(
-                [repr(arg) for arg in args] + [key + "=" + repr(value) for key, value in kwargs.items()]) + ")",
-                "expected": expected} for name, module, function, args, kwargs, expected
-                in contract_cases(self.state["requirements"])],
+            # Visible examples of the newly required behaviour only; the trusted
+            # validator also runs hidden checks and every earlier contract.
+            "new_requirement_examples": examples,
             "baseline_requirement": "receipt.format_total and email_receipt.format_email_total return original ruble amounts with two decimals. Preserve unrelated enabled feature flags; all three flags simultaneously enabled are incompatible.",
             "new_requirement": self.state["requirement"],
             "refusal": refusal,
-            "base_sha": base, "source_sha": source,
+            "base_sha": base, "source_sha": source, "changed_paths": changed,
             "common_ancestor": snapshot(common), "current_target": snapshot(base), "submission": snapshot(source),
             "current_candidate": {name: (directory / name).read_text(encoding="utf-8")
-                                  for name in sorted(ALLOWED) if (directory / name).is_file()},
+                                  for name in changed if (directory / name).is_file()},
             "previous_repairs": [{"reason": item.get("reason"), "explanation": item.get("explanation")}
                                  for item in self.result.get("repairs", [])],
-            "conflict_paths": sorted(self.text("diff", "--name-only", "--diff-filter=U", cwd=directory).splitlines()),
+            "conflict_paths": conflicts,
         }
 
     def apply_proposal(self, directory, proposal):
@@ -482,10 +506,17 @@ class Gate:
             raise error
         if int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")) > 1:
             raise Rejected("repair_rerun_blocked", "A job rerun cannot reset the automatic repair budget")
-        refusal = {"reason": error.reason, "validation": self.result.get("validation")}
+        refusal = self.refusal(error.reason)
         while self.state["repair_calls_reserved"] < MAX_REPAIRS:
             self.status(source, "pending", "Исправляем автоматически через DeepSeek (не более 2 попыток)")
+            # Everything that can fail without a model request happens before the
+            # reservation; after it, nothing but the request itself remains.
             self.check_pr("before_repair_reservation")
+            context = self.repair_context(directory, common, source, base, refusal)
+            try:
+                RouterRepairClient.from_environment(allowed_paths=ALLOWED).payload(context)
+            except RepairError as failure:
+                raise Rejected("repair_unavailable", failure.reason) from None
             reservation = None
             if self.state["durable_budget"]:
                 try:
@@ -511,11 +542,10 @@ class Gate:
             record["profile"] = ordinal
             self.result.setdefault("repairs", []).append(record)
             self.save()
-            # No GitHub status call between the reservation and the model request.
+            # No GitHub call between the reservation and the model request.
             try:
-                self.check_pr("before_router_post")
                 client = RouterRepairClient.from_environment(allowed_paths=ALLOWED, profile=ordinal)
-                proposal = client.propose(self.repair_context(directory, common, source, base, refusal))
+                proposal = client.propose(context)
                 record.update(metadata=proposal["metadata"], explanation=proposal["explanation"],
                               patch_sha256=hashlib.sha256(json.dumps(proposal["files"], sort_keys=True).encode()).hexdigest(),
                               changed_paths=sorted(proposal["files"]), state="proposed")
@@ -535,7 +565,7 @@ class Gate:
                     raise
                 record.update(state="failed", reason=failure.reason, candidate=self.result.get("candidate"),
                               validation=self.result.get("validation"), finished_at=now())
-                refusal = {"reason": failure.reason, "validation": self.result.get("validation")}
+                refusal = self.refusal(failure.reason)
             self.save()
         raise Rejected("repair_exhausted", "No safe repair after two reserved API attempts; preserve the branches for a human")
 
@@ -550,6 +580,7 @@ class Gate:
         accepted = self.read_requirements(base)
         incoming = self.state["requirement"]
         self.state["requirements"] = sorted(set(accepted) | ({incoming} if incoming != "baseline" else set()))
+        self.state["accepted_requirements"] = accepted
         attempt.update(accepted_requirements=accepted, required_contracts=self.state["requirements"])
         self.save()
         if self.ancestor(source, base):
@@ -573,7 +604,8 @@ class Gate:
         self.ordinary_files(base)
         directory = self.directory / ("candidate-" + str(number))
         self.git("worktree", "add", "--quiet", "--detach", str(directory), base)
-        merge = self.git("merge", "--no-ff", "--no-commit", source,
+        # zdiff3 markers carry the common ancestor, so a repair sees both deltas.
+        merge = self.git("-c", "merge.conflictStyle=zdiff3", "merge", "--no-ff", "--no-commit", source,
                          cwd=directory, check=False)
         try:
             if merge.returncode:
@@ -755,7 +787,13 @@ class Gate:
             self.status(self.state["active_source"], "error" if self.result["decision"] == "error" else "failure",
                         self.result.get("description", "Ошибка: итог запуска не доставлен"))
         elif self.result["decision"] == "accepted" and self.result.get("status_delivery") == "failed":
-            self.status(self.state["prepared"]["source"], "success", self.result["description"])
+            try:
+                self.status(self.state["prepared"]["source"], "success", self.result["description"])
+            except StatusError as error:
+                # The publication stays a fact; the reconciler redelivers the stale label.
+                self.result.setdefault("status_errors", []).append(str(error))
+                self.save()
+                return
             self.result["status_delivery"] = "confirmed_by_finalize"
             self.save()
 
