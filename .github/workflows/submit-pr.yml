@@ -4,7 +4,7 @@ run-name: 'PR #${{ github.event.number }} — ${{ github.event.action }} — ${{
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, edited]
-    branches: [feature/team-shared]
+    branches: [feature/team-shared, feature/lab-main]
 
 permissions:
   contents: read
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   submit:
-    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    if: github.event.pull_request.base.ref == 'feature/team-shared' && github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -43,3 +43,23 @@ jobs:
           path: ${{ runner.temp }}/pr-dispatch.json
           if-no-files-found: error
           retention-days: 30
+
+  # The workflow file of pull_request_target is read from the default branch, so the
+  # integration agent's trigger lives here; it only hands over the exact PR version.
+  fixbot:
+    if: github.event.pull_request.base.ref == 'feature/lab-main' && github.event.action != 'edited' && github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hand the exact PR version to the integration agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          for attempt in 1 2 3; do
+            gh workflow run fixbot.yml --repo "$GITHUB_REPOSITORY" --ref main               -f pr_number="$PR_NUMBER" -f head_ref="$HEAD_REF" -f expected_head="$HEAD_SHA" -f reason=pr_event && exit 0
+            sleep $((attempt * 5))
+          done
+          exit 1
