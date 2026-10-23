@@ -25,17 +25,15 @@ MAX_FILE_BYTES = 64 * 1024
 MAX_FILES_BYTES = 128 * 1024
 MAX_EXPLANATION_BYTES = 4 * 1024
 MAX_FILES = 16
-MAX_TIMEOUT = 300
+MAX_TIMEOUT = 180
 _BASE_PARAMETERS = {"stream": False, "temperature": 0, "response_format": {"type": "json_object"}}
-# DeepSeek reasons at high effort by default and the hidden reasoning shares
-# max_tokens with the answer. Attempt 1 limits it; attempt 2 must not repeat a
-# failed attempt 1, so it disables reasoning. The ledger ordinal selects one.
-# The cheapest default route serves fp4-quantized weights; prefer full-precision/fp8
-# providers and keep fallbacks so an outage does not burn the attempt.
-_ROUTE = {"provider": {"order": ["byteplus", "deepinfra"], "allow_fallbacks": True}}
+# Measured on the recorded conflicts (run 39923077698, 12 calls per variant): with
+# default high-effort reasoning the hidden reasoning used all 8192 tokens (0/3);
+# reasoning disabled resolved 12/12 in ~4 s, low effort 12/12 in ~50 s. Attempt 2
+# differs from attempt 1 and is not smaller. The ledger ordinal selects one.
 REPAIR_PROFILES = (
-    ({**_BASE_PARAMETERS, **_ROUTE, "max_tokens": 16384, "reasoning": {"effort": "low"}}, 180),
-    ({**_BASE_PARAMETERS, **_ROUTE, "max_tokens": 16384, "reasoning": {"enabled": False}}, 180),
+    ({**_BASE_PARAMETERS, "max_tokens": 8192, "reasoning": {"enabled": False}}, 90),
+    ({**_BASE_PARAMETERS, "max_tokens": 16384, "reasoning": {"effort": "low"}}, 180),
 )
 
 SYSTEM_PROMPT = """Repair the supplied public training code after an integration-queue rejection.
