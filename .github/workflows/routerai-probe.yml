@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline-8k, reasoning-disabled-8k, effort-none-8k, effort-low-16k, thinking-32k]
+        variant: [baseline-8k, queue-profile-1, queue-profile-2, effort-none-8k, thinking-32k]
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:

@@ -193,14 +193,19 @@ class QueueStatusTests(unittest.TestCase):
         self.assertFalse(any(body["state"] == "success" for _, body in self.api.posts))
         self.assertEqual(self.remote_head(), self.base)
 
-    def test_status_outage_after_publication_is_error_not_accepted(self):
+    def test_status_outage_after_publication_keeps_the_fact_and_finalize_redelivers(self):
         self.assertEqual(self.phase("prepare")[0], 0)
         self.api.fail_states.add("success")
         code, result = self.phase("publish")
-        self.assertEqual((code, result["decision"], result["reason"]), (1, "error", "status_delivery_failed"))
+        self.assertEqual((code, result["decision"], result["status_delivery"]), (0, "accepted", "failed"))
         self.assertTrue(result["publication_confirmed"])
-        self.assertEqual(self.api.items[self.source][-1]["state"], "error")
-        self.assertFalse(any(body["state"] == "success" for _, body in self.api.posts))
+        self.assertEqual(self.remote_head(), result["published_candidate"])
+        self.assertFalse(any(body["state"] in ("success", "error", "failure") for _, body in self.api.posts))
+        self.api.fail_states.clear()
+        code, result = self.phase("finalize")
+        self.assertEqual((code, result["decision"], result["status_delivery"]), (0, "accepted", "confirmed_by_finalize"))
+        self.assertEqual(self.api.items[self.source][-1]["state"], "success")
+        self.assertTrue(self.api.items[self.source][-1]["description"].startswith("Принято:"))
 
     def test_unknown_push_outcome_never_announces_acceptance(self):
         self.assertEqual(self.phase("prepare")[0], 0)
@@ -273,8 +278,8 @@ sys.exit(queue_gate.main())
     def test_finalize_closes_pending_and_unsafe_mode_is_not_a_cli_option(self):
         self.assertEqual(self.phase("prepare")[0], 0)
         code, result = self.phase("finalize")
-        self.assertEqual((code, result["decision"], result["reason"]), (1, "rejected", "interrupted"))
-        self.assertEqual(self.api.items[self.source][-1]["state"], "failure")
+        self.assertEqual((code, result["decision"], result["reason"]), (1, "error", "interrupted"))
+        self.assertEqual(self.api.items[self.source][-1]["state"], "error")
         count = len(self.api.posts)
         self.assertEqual(self.phase("finalize")[0], 1)
         self.assertEqual(len(self.api.posts), count)
@@ -284,6 +289,34 @@ sys.exit(queue_gate.main())
         self.assertNotEqual(process.returncode, 0)
         self.assertEqual(self.remote_head(), self.base)
         self.assertEqual(len(self.api.posts), count)
+
+    def test_job_killed_during_prepare_does_not_leave_pending(self):
+        wrapper = """import queue_gate, os, sys
+def killed(self, observation, trigger):
+    self.select_source(observation['source'])
+    self.status(observation['source'], 'pending', 'Проверяем')
+    os._exit(137)
+queue_gate.Gate.build = killed
+sys.exit(queue_gate.main())
+"""
+        state = self.root / "killed"
+        process = subprocess.run([sys.executable, "-c", wrapper, "prepare", "--repo", str(self.trusted),
+                                  "--state-dir", str(state), "--base-branch", "feature/team",
+                                  "--source-branch", "feature/source"], env=self.env, capture_output=True,
+                                 cwd=self.trusted)
+        self.assertEqual(process.returncode, 137)
+        self.assertEqual(self.api.items[self.source][-1]["state"], "pending")
+        code, result = self.phase("finalize", "killed")
+        self.assertEqual((code, result["decision"], result["reason"]), (1, "error", "interrupted"))
+        self.assertEqual(self.api.items[self.source][-1]["state"], "error")
+
+    def test_setup_failure_before_gate_reports_error_for_the_exact_head(self):
+        self.env.update(GITHUB_ACTIONS="true", EXPECTED_HEAD=self.source)
+        code, result = self.phase("finalize", "never-started")
+        self.assertEqual((code, result["decision"], result["reason"]), (1, "error", "setup_failed"))
+        self.assertEqual(self.api.items[self.source][-1]["state"], "error")
+        self.assertEqual(self.api.items[self.source][-1]["context"], CommitStatuses.context("feature/team-shared"))
+        self.assertEqual(self.remote_head(), self.base)
 
     def test_github_sandbox_uses_fixed_image_and_only_readonly_exports(self):
         gate = Gate(self.trusted, self.root / "sandbox-state")

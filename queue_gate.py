@@ -22,7 +22,7 @@ import uuid
 
 from queue_status import CommitStatuses, StatusError
 from queue_repair import RouterRepairClient, RepairError, MODEL, strict_json
-from queue_pr import guard as guard_pr, PRError, EVENTS, TARGET
+from queue_pr import guard as guard_pr, PRError, EVENTS, RECONCILE, TARGET
 from queue_structural import StructuralRepairClient, StructuralError
 from queue_budget import reserve as reserve_budget, BudgetError
 from acceptance import CONTRACTS, REGISTRY_PATH, contract_cases
@@ -34,7 +34,7 @@ MAX_REPAIRS = 2
 VALIDATION_IMAGE = "python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2"
 INFRASTRUCTURE_ERRORS = {"internal_error", "git_error", "status_delivery_failed", "trusted_control_changed",
                          "publication_unconfirmed", "validation_infrastructure_error", "candidate_not_observed",
-                         "structural_infrastructure_error", "budget_unavailable"}
+                         "structural_infrastructure_error", "budget_unavailable", "setup_failed", "interrupted"}
 REASONS_RU = {
     "validation_failed": "проверки общего результата не пройдены",
     "merge_conflict": "изменения конфликтуют с общей веткой",
@@ -61,6 +61,7 @@ REASONS_RU = {
     "invalid_pr_requirement": "в описании PR нужно указать одно известное требование",
     "structural_infrastructure_error": "не удалось запустить проверенный Mergiraf",
     "budget_unavailable": "не удалось подтвердить сохранённый лимит ремонта",
+    "setup_failed": "подготовка очереди не завершилась; заявка будет повторена",
 }
 
 
@@ -506,12 +507,14 @@ class Gate:
                       "source": source, "base": base, "refusal": refusal, "state": "reserved"}
             if reservation:
                 record["budget_reservation"] = reservation
+            ordinal = reservation["ordinal"] if reservation else record["number"]
+            record["profile"] = ordinal
             self.result.setdefault("repairs", []).append(record)
             self.save()
             # No GitHub status call between the reservation and the model request.
             try:
                 self.check_pr("before_router_post")
-                client = RouterRepairClient.from_environment(allowed_paths=ALLOWED)
+                client = RouterRepairClient.from_environment(allowed_paths=ALLOWED, profile=ordinal)
                 proposal = client.propose(self.repair_context(directory, common, source, base, refusal))
                 record.update(metadata=proposal["metadata"], explanation=proposal["explanation"],
                               patch_sha256=hashlib.sha256(json.dumps(proposal["files"], sort_keys=True).encode()).hexdigest(),
@@ -625,7 +628,7 @@ class Gate:
                                             ("PR_NUMBER", "EXPECTED_HEAD", "DISPATCHER_RUN_ID"))
             action = os.environ.get("PR_EVENT_ACTION", "")
             if (args.base_branch != TARGET or not number.isdigit() or not dispatcher.isdigit()
-                    or not re.fullmatch(r"[0-9a-f]{40}", expected) or action not in EVENTS):
+                    or not re.fullmatch(r"[0-9a-f]{40}", expected) or action not in EVENTS | {RECONCILE}):
                 raise Rejected("invalid_pr", "A PR event number, exact head and dispatcher trace are required")
             self.state["pr_request"] = {"pr_number": int(number), "expected_head": expected,
                                         "source_branch": args.source_branch, "requirement": args.requirement}
@@ -656,13 +659,25 @@ class Gate:
             raise Rejected("publication_unconfirmed", "Push outcome requires a later remote observation") from error
         if not self.result["candidate_in_observed_history"]:
             raise Rejected("candidate_not_observed", "Remote target does not contain the exact tested candidate")
-        self.result.update(publication_confirmed=True, published_candidate=candidate)
-        self.status(self.state["prepared"]["source"], "success", "Принято: " + self.state["prepared"]["source"][:8]
-                    + ", база " + self.state["prepared"]["base"][:8] + ", опубликован " + candidate[:8])
-        self.result.update(decision="accepted", reason=reason, decision_label="Принято")
+        self.result.update(publication_confirmed=True, published_candidate=candidate,
+                           decision="accepted", reason=reason, decision_label="Принято",
+                           description=self.accepted_description())
         self.result["attempts"][-1]["decision"] = "accepted"
         self.log("Принято: " + candidate)
         self.save()
+        try:
+            self.status(self.state["prepared"]["source"], "success", self.result["description"])
+        except StatusError as error:
+            # The publication is a fact; only its UI label is late. finalize and
+            # the reconciler deliver it again instead of reporting a false error.
+            self.result.setdefault("status_errors", []).append(str(error))
+            self.result["status_delivery"] = "failed"
+            self.save()
+
+    def accepted_description(self):
+        prepared = self.state["prepared"]
+        return ("Принято: " + prepared["source"][:8] + ", база " + prepared["base"][:8]
+                + ", опубликован " + prepared["candidate"][:8])
 
     def publisher_remote(self):
         if os.environ.get("QUEUE_SSH_PUBLISH") != "true":
@@ -723,14 +738,26 @@ class Gate:
 
     def finalize(self):
         if not self.state_path.exists() or not self.result_path.exists():
+            expected = os.environ.get("EXPECTED_HEAD", "")
+            if os.environ.get("GITHUB_ACTIONS") == "true" and re.fullmatch(r"[0-9a-f]{40}", expected):
+                # Setup failed before the gate existed; the PR must not stay silent.
+                self.state = {"base_branch": TARGET, "active_source": expected}
+                self.result.update(expected_head=expected, base_branch=TARGET)
+                self.reject("setup_failed", "The queue job stopped before the gate started")
             return
         self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.result = json.loads(self.result_path.read_text(encoding="utf-8"))
         if self.result["decision"] == "prepared":
             self.reject("publication_unconfirmed" if self.result.get("publication_attempted") else "interrupted")
+        elif self.result["reason"] == "not_prepared" and self.state.get("active_source"):
+            self.reject("interrupted", "The job stopped before the request reached a decision")
         elif self.result["decision"] in ("error", "rejected") and self.result.get("status_delivery") == "failed":
             self.status(self.state["active_source"], "error" if self.result["decision"] == "error" else "failure",
                         self.result.get("description", "Ошибка: итог запуска не доставлен"))
+        elif self.result["decision"] == "accepted" and self.result.get("status_delivery") == "failed":
+            self.status(self.state["prepared"]["source"], "success", self.result["description"])
+            self.result["status_delivery"] = "confirmed_by_finalize"
+            self.save()
 
     def repair_accounting(self):
         repairs = self.result.get("repairs", [])

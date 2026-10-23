@@ -12,6 +12,7 @@ from queue_status import CommitStatuses, StatusError, MAX_REQUEST_ATTEMPTS, RETR
 TARGET = "feature/team-shared"
 STATE_BRANCH = "feature/queue-state"
 EVENTS = {"opened", "synchronize", "reopened", "ready_for_review", "edited"}
+RECONCILE = "reconcile"
 
 
 class PRError(RuntimeError):
@@ -77,7 +78,10 @@ def dispatch(event, api, run_id):
     if (payload_pr.get("base") or {}).get("ref") != TARGET:
         return {"decision": "ignored", "reason": "different_target"}
     request = validate_pr(payload_pr, api.repository, event.get("number"))
-    request = guard(api, request)
+    return submit(api, guard(api, request), run_id, action)
+
+
+def submit(api, request, run_id, action):
     inputs = {key: str(value) for key, value in request.items()}
     inputs.update(dispatcher_run_id=str(run_id), event_action=action, hold_seconds="0")
     # A repeated dispatch after a lost response is harmless: queue runs are

@@ -20,12 +20,16 @@ OLD = {"prefix", "suffix", "round-up", "discount", "fee", "currency"}
 ROUNDS = (("decimal-separator", "thousands", "explicit-sign"),
           ("trim-zeros", "grouping-pattern", "negative-parentheses"),
           ("minimum-fraction", "grouping-threshold", "zero-text"))
-NEW = set().union(*ROUNDS)
+SERIES_TWO = (("minimum-fraction", "grouping-pattern", "negative-parentheses"),
+              ("sign-space", "grouping-threshold", "zero-text"),
+              ("integer-padding", "grouping-myriad", "negative-trailing"))
+ADDED = {"sign-space", "integer-padding", "grouping-myriad", "negative-trailing"}
+NEW = set().union(*ROUNDS) | ADDED
 OPTION_CONTRACT = {"prefix": "prefix", "suffix": "suffix", "decimal_separator": "decimal-separator",
                    "thousands_separator": "thousands", "show_plus": "explicit-sign", "trim_zeros": "trim-zeros",
                    "grouping": "grouping-pattern", "negative_style": "negative-parentheses",
                    "min_fraction_digits": "minimum-fraction", "group_min_digits": "grouping-threshold",
-                   "zero_text": "zero-text"}
+                   "zero_text": "zero-text", "sign_space": "sign-space", "min_integer_digits": "integer-padding"}
 
 
 def base_number(amount):
@@ -185,6 +189,38 @@ class FormattingCatalogueTests(unittest.TestCase):
         self.assertEqual(1, code)
         failed = {x["check"] for x in report["checks"] if not x["passed"]}
         self.assertTrue({"format:zero-text-rounded", "format:zero-text-rounded-negative"} <= failed)
+
+    def test_second_series_rounds_activate_monotonically_with_own_and_triple_vectors(self):
+        previous = OLD | {"decimal-separator", "thousands", "explicit-sign", "trim-zeros"}
+        triples = ("format:r2-all", "format:s2r2-all", "format:s2r3-all-negative")
+        for round_ids, triple in zip(SERIES_TWO, triples):
+            for order in itertools.permutations(round_ids):
+                accepted = set(previous)
+                old_cases = self.selected(accepted)
+                for requirement in order:
+                    accepted.add(requirement)
+                    selected = self.selected(accepted)
+                    self.assertEqual(old_cases, {name: selected[name] for name in old_cases})
+                    old_cases = selected
+                self.assertIn(triple, selected)
+            for requirement in round_ids:
+                own = [case for case in acceptance.FORMATTING_CASES
+                       if requirement in case[1] and set(case[1]) <= previous | {requirement}]
+                self.assertGreaterEqual(len(own), 5, requirement)
+            previous |= set(round_ids)
+
+    def test_second_series_features_are_absent_from_the_accepted_base(self):
+        def base(amount, prefix="", suffix="", **options):
+            return prefix + base_number(amount) + suffix
+        prior = OLD | set().union(*ROUNDS)
+        for requirement in ADDED:
+            code, report = self.oracle(base, prior | {requirement})
+            own = {x["check"] for x in report["checks"] if not x["passed"]
+                   and requirement in dict((c[0], c[1]) for c in acceptance.FORMATTING_CASES)[x["check"][7:]]}
+            self.assertEqual(1, code, requirement)
+            self.assertGreaterEqual(len(own), 3, requirement)
+        self.assertEqual("Итого 0 0123 4567,8 - руб.", self.selected(OLD | NEW)["format:s2r3-all-negative"][-1])
+        self.assertEqual("Итого + 0 0123 4567,8 руб.", self.selected(OLD | NEW)["format:s2r3-all-positive"][-1])
 
     def test_returned_options_are_not_shared_with_the_frozen_catalogue(self):
         case = self.selected(OLD | NEW)["format:decimal-comma"]

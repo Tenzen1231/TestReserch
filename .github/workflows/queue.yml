@@ -36,6 +36,10 @@ on:
           - minimum-fraction
           - grouping-threshold
           - zero-text
+          - sign-space
+          - integer-padding
+          - grouping-myriad
+          - negative-trailing
       pr_number:
         description: 'Номер открытого PR (заполняет автоматический диспетчер)'
         required: true
@@ -73,7 +77,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: queue-publisher
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       BASE_BRANCH: ${{ inputs.base_branch }}
       SOURCE_BRANCH: ${{ inputs.source_branch }}
@@ -99,12 +103,18 @@ jobs:
         run: echo "STATE_DIR=$RUNNER_TEMP/council-ci-gate" >> "$GITHUB_ENV"
 
       - name: Prepare isolated validator image
-        run: docker pull python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2
+        run: |
+          for attempt in 1 2 3; do
+            docker pull python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2 && exit 0
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Install verified Mergiraf 0.20.0
         run: |
           mkdir -p "$RUNNER_TEMP/mergiraf"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 4 --retry-all-errors --retry-delay 5 \
             https://codeberg.org/mergiraf/mergiraf/releases/download/v0.20.0/mergiraf_x86_64-unknown-linux-musl.tar.gz \
             --output "$RUNNER_TEMP/mergiraf/archive.tar.gz"
           printf '%s  %s\n' fc77469be936b02ab9021b984a3aebc9250a21ae3d264f2ef2198eb8b31b2a7b "$RUNNER_TEMP/mergiraf/archive.tar.gz" | sha256sum --check --strict
@@ -119,13 +129,20 @@ jobs:
           QUEUE_DEPLOY_KEY: ${{ secrets.QUEUE_DEPLOY_KEY }}
         run: |
           python - <<'PY'
-          import json, os, pathlib, urllib.request
+          import json, os, pathlib, time, urllib.request
           from queue_status import NoRedirect
           request = urllib.request.Request('https://api.github.com/meta', headers={
               'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN'],
               'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
-          with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
-              keys = json.load(response)['ssh_keys']
+          for attempt in range(3):
+              try:
+                  with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+                      keys = json.load(response)['ssh_keys']
+                  break
+              except (OSError, ValueError, KeyError):
+                  if attempt == 2:
+                      raise
+                  time.sleep(10 * (attempt + 1))
           if not keys or any('\n' in key or '\r' in key for key in keys):
               raise SystemExit('GitHub did not return valid SSH host keys')
           pathlib.Path(os.environ['RUNNER_TEMP'], 'github_known_hosts').write_text(

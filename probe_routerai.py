@@ -22,9 +22,9 @@ CASES = {
 BASE = {"stream": False, "temperature": 0, "response_format": {"type": "json_object"}}
 VARIANTS = {
     "baseline-8k": (dict(BASE, max_tokens=8192), 90, 1),
-    "reasoning-disabled-8k": (dict(BASE, max_tokens=8192, reasoning={"enabled": False}), 90, 2),
+    "queue-profile-1": (*queue_repair.REPAIR_PROFILES[0], 2),
+    "queue-profile-2": (*queue_repair.REPAIR_PROFILES[1], 2),
     "effort-none-8k": (dict(BASE, max_tokens=8192, reasoning_effort="none"), 90, 2),
-    "effort-low-16k": (dict(BASE, max_tokens=16384, reasoning={"effort": "low"}), 180, 2),
     "thinking-32k": (dict(BASE, max_tokens=32768), 300, 2),
 }
 
@@ -35,8 +35,6 @@ def main():
     repo = Path(os.environ["GITHUB_WORKSPACE"])
     out = Path(os.environ["RUNNER_TEMP"]) / "probe"
     out.mkdir(parents=True, exist_ok=True)
-    queue_repair.REQUEST_PARAMETERS = parameters
-    queue_repair.MAX_TIMEOUT = timeout
     records = []
     for case, (source, requirement) in CASES.items():
         for repetition in range(1, repetitions + 1):
@@ -57,6 +55,7 @@ def main():
                       "context_bytes": len(json.dumps(context, ensure_ascii=False).encode())}
             try:
                 client = RouterRepairClient(os.environ.get("ROUTERAI_API_KEY"), ALLOWED, timeout)
+                client.parameters = parameters
                 proposal = client.propose(context)
                 record.update(metadata=proposal["metadata"], explanation=proposal["explanation"][:400])
                 gate.apply_proposal(directory, proposal)

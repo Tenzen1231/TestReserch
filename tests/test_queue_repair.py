@@ -201,12 +201,24 @@ class QueueRepairTests(unittest.TestCase):
         shape = self.fails("repair_incomplete_response").metadata["response_shape"]
         self.assertEqual((shape["finish_reason"], shape["content_type"]), ("unrecognized", "NoneType"))
 
-    def test_request_parameters_are_the_recorded_fixed_parameters(self):
-        self.client.propose(self.context)
-        body = json.loads(self.api.requests[-1]["body"])
-        self.assertEqual(body["model"], queue_repair.MODEL)
-        self.assertEqual({key: body[key] for key in queue_repair.REQUEST_PARAMETERS}, queue_repair.REQUEST_PARAMETERS)
-        self.assertEqual(set(body), {"model", "messages", *queue_repair.REQUEST_PARAMETERS})
+    def test_each_attempt_profile_sends_its_recorded_parameters_and_they_differ(self):
+        bodies = []
+        for profile, (parameters, timeout) in enumerate(queue_repair.REPAIR_PROFILES, 1):
+            client = RouterRepairClient(FIXTURE_KEY, ["receipt.py"], profile=profile)
+            metadata = client.propose(self.context)["metadata"]
+            body = json.loads(self.api.requests[-1]["body"])
+            self.assertEqual(body["model"], queue_repair.MODEL)
+            self.assertEqual(set(body), {"model", "messages", *parameters})
+            self.assertEqual({key: body[key] for key in parameters}, parameters)
+            self.assertEqual((metadata["request_parameters"], metadata["profile"], metadata["timeout_seconds"]),
+                             (parameters, profile, timeout))
+            self.assertLess(body["max_tokens"] * 0.007, timeout)  # ~150 tokens/s measured on RouterAI.
+            bodies.append({key: body[key] for key in parameters})
+        self.assertNotEqual(bodies[0], bodies[1])
+        for profile in (0, 3, True):
+            with self.subTest(profile=profile), self.assertRaises(RepairError) as caught:
+                RouterRepairClient(FIXTURE_KEY, ["receipt.py"], profile=profile)
+            self.assertEqual(caught.exception.reason, "repair_invalid_profile")
 
     def test_model_mismatch_is_rejected_and_missing_identity_is_explicit(self):
         self.api.body = envelope(model="deepseek/different-model")
@@ -252,7 +264,7 @@ class QueueRepairTests(unittest.TestCase):
         self.fails("repair_transport_error", client=client)
         self.assertLess(time.monotonic() - started, 1)
         self.assertEqual(len(self.api.requests), 1)
-        for timeout in (0, -1, 91, float("nan"), float("inf"), True):
+        for timeout in (0, -1, queue_repair.MAX_TIMEOUT + 1, float("nan"), float("inf"), True):
             with self.subTest(timeout=timeout), self.assertRaises(RepairError) as caught:
                 RouterRepairClient(FIXTURE_KEY, ["receipt.py"], timeout=timeout)
             self.assertEqual(caught.exception.reason, "repair_invalid_timeout")
@@ -272,7 +284,7 @@ class QueueRepairTests(unittest.TestCase):
             self.assertGreaterEqual(metadata["elapsed_seconds"], 0)
             self.assertEqual(set(metadata), {"request_sha256", "response_sha256", "id", "requested_model",
                                               "returned_model", "usage", "elapsed_seconds", "request_parameters",
-                                              "request_sent", "response_received", "http_status",
+                                              "profile", "timeout_seconds", "request_sent", "response_received", "http_status",
                                               "response_bytes", "response_shape"})
             self.assertEqual((metadata["request_sent"], metadata["response_received"], metadata["http_status"]),
                              (True, True, 200))
@@ -282,8 +294,9 @@ class QueueRepairTests(unittest.TestCase):
     def test_failed_transport_and_untrusted_envelope_keep_only_valid_metadata(self):
         self.api.drop_response = True
         metadata = self.fails("repair_transport_error").metadata
-        self.assertEqual(set(metadata), {"request_sha256", "requested_model", "elapsed_seconds",
-                                          "request_parameters", "request_sent", "response_received"})
+        self.assertEqual(set(metadata), {"request_sha256", "requested_model", "elapsed_seconds", "profile",
+                                          "timeout_seconds", "request_parameters", "request_sent",
+                                          "response_received"})
         self.assertEqual((metadata["request_sent"], metadata["response_received"]), (True, False))
         self.assertEqual(metadata["request_sha256"], hashlib.sha256(self.api.requests[-1]["body"]).hexdigest())
         self.api.drop_response = False
@@ -293,7 +306,8 @@ class QueueRepairTests(unittest.TestCase):
             self.api.body = body
             metadata = self.fails(reason).metadata
             self.assertEqual(set(metadata), {"request_sha256", "response_sha256", "requested_model", "elapsed_seconds",
-                                              "request_parameters", "request_sent", "response_received",
+                                              "request_parameters", "profile", "timeout_seconds",
+                                              "request_sent", "response_received",
                                               "http_status", "response_bytes"})
             self.assertTrue(metadata["response_received"])
             self.assertEqual(metadata["response_sha256"], hashlib.sha256(body).hexdigest())

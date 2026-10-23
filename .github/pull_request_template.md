@@ -4,7 +4,8 @@ Queue-Requirement: baseline
 
 Выберите одно требование вместо baseline: discount, fee, currency, prefix, suffix, round-up.
 Режимы одной функции форматирования: decimal-separator, trim-zeros, minimum-fraction,
-thousands, grouping-pattern, grouping-threshold, explicit-sign, negative-parentheses, zero-text.
+thousands, grouping-pattern, grouping-threshold, grouping-myriad, explicit-sign, negative-parentheses,
+negative-trailing, zero-text, sign-space, integer-padding.
 baseline проверяет прежнее поведение и все уже принятые фичи.
 Если нужен новый контракт, сначала добавьте его в доверенные проверки очереди.
 

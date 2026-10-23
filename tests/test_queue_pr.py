@@ -1,9 +1,10 @@
 """PR metadata cannot select arbitrary code, stale versions or new requirements."""
 import copy
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from queue_pr import PRError, TARGET, dispatch, guard, requirement_from_body, validate_pr
+from queue_status import StatusError
 
 
 REPOSITORY = "fixture/repository"
@@ -51,6 +52,19 @@ class PRTests(unittest.TestCase):
         self.assertEqual(post.args[2]["ref"], "main")
         self.assertEqual(post.args[2]["inputs"]["expected_head"], SHA)
         self.assertEqual(post.args[2]["inputs"]["dispatcher_run_id"], "123")
+
+    def test_transient_dispatch_failure_is_repeated_but_permanent_one_is_not(self):
+        item = pr()
+        api = Mock(repository=REPOSITORY)
+        api.request.side_effect = [item, StatusError("HTTP 502", transient=True), None]
+        with patch("queue_pr.RETRY_DELAYS", (0, 0)):
+            result = dispatch({"action": "opened", "number": 7, "pull_request": item}, api, "123")
+        self.assertEqual((result["decision"], result["dispatch_attempts"]), ("dispatched", 2))
+        api.request.side_effect = [item, StatusError("HTTP 422")]
+        api.request.reset_mock()
+        with patch("queue_pr.RETRY_DELAYS", (0, 0)), self.assertRaises(StatusError):
+            dispatch({"action": "opened", "number": 7, "pull_request": item}, api, "123")
+        self.assertEqual(api.request.call_count, 2)
 
     def test_stale_event_never_dispatches_new_head(self):
         old, new = pr(), pr()

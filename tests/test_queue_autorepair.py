@@ -288,12 +288,14 @@ class QueueAutorepairTests(unittest.TestCase):
         reservations = [{"ordinal": i, "ledger_commit": str(i) * 40} for i in (1, 2)]
         with patch.dict(os.environ, QUEUE_DURABLE_BUDGET="true"), \
                 patch("queue_gate.reserve_budget", side_effect=reservations) as ledger, \
-                patch("queue_gate.RouterRepairClient.from_environment", return_value=model):
+                patch("queue_gate.RouterRepairClient.from_environment", return_value=model) as client:
             with self.assertRaises(Rejected) as error:
                 gate.prepare(gate.args)
         self.assertEqual(error.exception.reason, "repair_exhausted")
         self.assertEqual(model.propose.call_count, 2)
         self.assertEqual(ledger.call_count, 2)
+        self.assertEqual([call.kwargs["profile"] for call in client.call_args_list], [1, 2])
+        self.assertEqual([item["profile"] for item in gate.result["repairs"]], [1, 2])
         repeated = self.gate("durable-new-run", "feature/fee", "fee")
         with patch.dict(os.environ, QUEUE_DURABLE_BUDGET="true", GITHUB_RUN_ID="999"), \
                 patch("queue_gate.reserve_budget", side_effect=BudgetError("budget_exhausted", "Two slots used")), \
