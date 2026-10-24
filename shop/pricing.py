@@ -4,6 +4,7 @@ COURIER_FEE_CENTS = 30000
 FREE_COURIER_FROM_CENTS = 300000
 DELIVERY_METHODS = ("pickup", "courier")
 MAX_QTY = 99
+MIN_ORDER_CENTS = 10000
 
 
 def line_total(item):
@@ -58,6 +59,8 @@ def price_breakdown(items, customer=None, promo_code=None, *, delivery="pickup")
     if any(item.price_cents < 0 for item in items):
         raise ValueError("цена не может быть отрицательной")
     base = subtotal(items)
+    if base < MIN_ORDER_CENTS:
+        raise ValueError("минимальная сумма заказа 100 ₽")
     gold = customer_discount(items, customer)
     promo = min(promo_discount(base, promo_code), base - gold)
     delivery_cents = delivery_cost(items, delivery)
